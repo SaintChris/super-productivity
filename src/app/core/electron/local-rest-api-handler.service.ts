@@ -1,16 +1,17 @@
 import { Injectable, inject } from '@angular/core';
 import { Store } from '@ngrx/store';
 import { firstValueFrom } from 'rxjs';
-import typia from 'typia';
+import { nanoid } from 'nanoid';
 import { TaskService } from '../../features/tasks/task.service';
 import { Task, TaskWithSubTasks } from '../../features/tasks/task.model';
 import { TaskArchiveService } from '../../features/archive/task-archive.service';
 import { ProjectService } from '../../features/project/project.service';
 import { TagService } from '../../features/tag/tag.service';
 import { TODAY_TAG } from '../../features/tag/tag.const';
+import { NoteService } from '../../features/note/note.service';
+import { TaskRepeatCfgService } from '../../features/task-repeat-cfg/task-repeat-cfg.service';
+import { isTaskOverdue } from '../../features/tasks/util/is-task-overdue';
 import { DateService } from '../date/date.service';
-import { isTodayWithOffset } from '../../util/is-today.util';
-import { isValidDBDateStr } from '../../util/get-db-date-str';
 
 import { TaskSharedActions } from '../../root-store/meta/task-shared.actions';
 import { getDeadlineAutoPlanFields } from '../../features/tasks/util/get-deadline-auto-plan-fields';
@@ -29,326 +30,33 @@ import {
   LocalRestApiRequestPayload,
   LocalRestApiResponsePayload,
 } from '../../../../electron/shared-with-frontend/local-rest-api.model';
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
-/** Only these fields may be set via the REST API to prevent state corruption. */
-const ALLOWED_TASK_FIELDS = new Set<string>([
-  'title',
-  'notes',
-  'isDone',
-  'timeEstimate',
-  'timeSpent',
-  'projectId',
-  'tagIds',
-  'dueDay',
-  'dueWithTime',
-  'plannedAt',
-  'deadlineDay',
-  'deadlineWithTime',
-  'deadlineRemindAt',
-]);
-
-/**
- * Relational fields that callers often try to set but must be rejected:
- * mutating them as plain values corrupts invariants (parent<->child links,
- * projectId inheritance, tag-ordering lists). Subtask creation is available
- * via `POST /tasks` with `parentId` — see `_handleCreateTask`.
- */
-const REJECTED_TASK_FIELDS = ['parentId', 'subTaskIds'] as const;
-
-/**
- * Fields a subtask inherits from its parent at the reducer (`addSubTask`
- * forces `tagIds: []` and `projectId = parent.projectId`). Reject them on
- * subtask create so callers don't get a 201 with values different from what
- * they sent.
- */
-const SUBTASK_INHERITED_FIELDS = ['projectId', 'tagIds'] as const;
-
-const pickAllowedFields = (body: Record<string, unknown>): Partial<Task> => {
-  const result: Record<string, unknown> = {};
-  for (const key of Object.keys(body)) {
-    if (ALLOWED_TASK_FIELDS.has(key)) {
-      result[key] = body[key];
-    }
-  }
-  return result as Partial<Task>;
-};
-
-/**
- * Value-level types for the fields writable via the REST API. Keys mirror
- * ALLOWED_TASK_FIELDS; `pickAllowedFields` filters by key only, so this is
- * where the *values* get checked. Without it a caller could push a wrong-typed
- * value (e.g. `tagIds: 123`, `timeEstimate: 'abc'`) straight into the store and
- * the synced op-log, where it corrupts state locally and trips typia-as-corrupt
- * on other devices when the op replays.
- */
-interface WritableTaskFields {
-  title?: string;
-  notes?: string;
-  isDone?: boolean;
-  timeEstimate?: number;
-  timeSpent?: number;
-  projectId?: string;
-  tagIds?: string[];
-  dueDay?: string | null;
-  dueWithTime?: number | null;
-  plannedAt?: number;
-  deadlineDay?: string | null;
-  deadlineWithTime?: number | null;
-  deadlineRemindAt?: number | null;
-}
-
-type FieldTypeError = { path: string; expected: string };
-
-/**
- * Validates the value types of already-key-filtered task fields. The create
- * path is separately guarded by `typia.assert<Task>` in the task service (a
- * bad value throws → generic 500); validating here lets both create and PATCH
- * reject bad input with a clean 400 before anything is dispatched.
- */
-const validateWritableFields = (
-  fields: Partial<Task>,
-): { ok: true } | { ok: false; errors: FieldTypeError[] } => {
-  const result = typia.validate<WritableTaskFields>(fields);
-  if (result.success) {
-    return { ok: true };
-  }
-  return {
-    ok: false,
-    errors: result.errors.map((e) => ({ path: e.path, expected: e.expected })),
-  };
-};
-
-const DEADLINE_FIELDS = ['deadlineDay', 'deadlineWithTime', 'deadlineRemindAt'] as const;
-
-type DeadlineChange =
-  | {
-      type: 'set';
-      fields: {
-        deadlineDay?: string;
-        deadlineWithTime?: number;
-        deadlineRemindAt?: number;
-      };
-    }
-  | { type: 'clearReminder' }
-  | { type: 'remove' };
-
-const hasOwn = (value: object, key: string): boolean =>
-  Object.prototype.hasOwnProperty.call(value, key);
-
-const validateDeadlineFields = (
-  fields: Partial<WritableTaskFields>,
-): string | undefined => {
-  if (fields.deadlineDay != null && fields.deadlineWithTime != null) {
-    return 'deadlineDay and deadlineWithTime cannot both be set';
-  }
-  if (typeof fields.deadlineDay === 'string' && !isValidDBDateStr(fields.deadlineDay)) {
-    return 'deadlineDay must be a valid YYYY-MM-DD date';
-  }
-  if (fields.deadlineWithTime != null && fields.deadlineWithTime <= 0) {
-    return 'deadlineWithTime must be a positive timestamp';
-  }
-  if (fields.deadlineRemindAt != null && fields.deadlineRemindAt <= 0) {
-    return 'deadlineRemindAt must be a positive timestamp';
-  }
-  return undefined;
-};
-
-/**
- * Resolves which deadline day/time the request results in, before reminders
- * are considered. An omitted field carries the task's current value over; a
- * newly supplied deadline type replaces the other type, matching the
- * mutual-exclusivity behavior of the deadline meta-reducer.
- */
-const resolveDeadlineValue = (
-  fields: Partial<WritableTaskFields>,
-  existingTask?: Task,
-): { deadlineDay?: string; deadlineWithTime?: number } => {
-  const hasDay = hasOwn(fields, 'deadlineDay');
-  const hasTime = hasOwn(fields, 'deadlineWithTime');
-  const requestedDay = fields.deadlineDay ?? undefined;
-  const requestedTime = fields.deadlineWithTime ?? undefined;
-  let deadlineDay = hasDay ? requestedDay : (existingTask?.deadlineDay ?? undefined);
-  let deadlineWithTime = hasTime
-    ? requestedTime
-    : (existingTask?.deadlineWithTime ?? undefined);
-  if (requestedDay !== undefined) deadlineWithTime = undefined;
-  if (requestedTime !== undefined) deadlineDay = undefined;
-  return { deadlineDay, deadlineWithTime };
-};
-
-/**
- * Resolves what happens to the reminder once the resulting deadline is known.
- * A supplied value wins; a changed deadline without one clears the old
- * reminder, just like the UI's setDeadline action; an otherwise unchanged
- * deadline keeps its reminder. An explicit null that would otherwise keep an
- * existing reminder becomes 'clear' so only the reminder is touched, without
- * re-planning the deadline.
- *
- * Takes the *normalized* existing reminder (see `resolveDeadlineChange`): a
- * stored `null` means "no reminder", so it must neither be carried over into
- * `setDeadline` nor turn a `{"deadlineRemindAt": null}` no-op into a
- * `clearDeadlineReminder` op.
- */
-const resolveReminderChange = (
-  fields: Partial<WritableTaskFields>,
-  existingDeadlineRemindAt: number | undefined,
-  isDeadlineValueChanged: boolean,
-): { type: 'clear' } | { type: 'value'; remindAt: number | undefined } => {
-  if (!hasOwn(fields, 'deadlineRemindAt')) {
-    return {
-      type: 'value',
-      remindAt: isDeadlineValueChanged ? undefined : existingDeadlineRemindAt,
-    };
-  }
-  const requested = fields.deadlineRemindAt ?? undefined;
-  if (
-    requested === undefined &&
-    !isDeadlineValueChanged &&
-    existingDeadlineRemindAt !== undefined
-  ) {
-    return { type: 'clear' };
-  }
-  return { type: 'value', remindAt: requested };
-};
-
-const resolveDeadlineChange = (
-  fields: Partial<WritableTaskFields>,
-  existingTask?: Task,
-): { ok: true; change?: DeadlineChange } | { ok: false; message: string } => {
-  const hasDay = hasOwn(fields, 'deadlineDay');
-  const hasTime = hasOwn(fields, 'deadlineWithTime');
-  const hasReminder = hasOwn(fields, 'deadlineRemindAt');
-  if (!hasDay && !hasTime && !hasReminder) {
-    return { ok: true };
-  }
-
-  const { deadlineDay, deadlineWithTime } = resolveDeadlineValue(fields, existingTask);
-
-  if (deadlineDay === undefined && deadlineWithTime === undefined) {
-    if (fields.deadlineRemindAt != null) {
-      return { ok: false, message: 'deadlineRemindAt requires a deadline' };
-    }
-    const hasExistingDeadline = Boolean(
-      existingTask?.deadlineDay ||
-      existingTask?.deadlineWithTime ||
-      existingTask?.deadlineRemindAt,
-    );
-    return {
-      ok: true,
-      change: hasExistingDeadline && (hasDay || hasTime) ? { type: 'remove' } : undefined,
-    };
-  }
-
-  const existingDeadlineDay = existingTask?.deadlineDay ?? undefined;
-  const existingDeadlineWithTime = existingTask?.deadlineWithTime ?? undefined;
-  const existingDeadlineRemindAt = existingTask?.deadlineRemindAt ?? undefined;
-  const isDeadlineValueChanged =
-    deadlineDay !== existingDeadlineDay || deadlineWithTime !== existingDeadlineWithTime;
-
-  const reminder = resolveReminderChange(
-    fields,
-    existingDeadlineRemindAt,
-    isDeadlineValueChanged,
-  );
-  if (reminder.type === 'clear') {
-    return { ok: true, change: { type: 'clearReminder' } };
-  }
-  const deadlineRemindAt = reminder.remindAt;
-
-  if (
-    existingTask &&
-    deadlineDay === existingDeadlineDay &&
-    deadlineWithTime === existingDeadlineWithTime &&
-    deadlineRemindAt === existingDeadlineRemindAt
-  ) {
-    return { ok: true };
-  }
-
-  return {
-    ok: true,
-    change: {
-      type: 'set',
-      fields: {
-        ...(deadlineDay !== undefined ? { deadlineDay } : {}),
-        ...(deadlineWithTime !== undefined ? { deadlineWithTime } : {}),
-        ...(deadlineRemindAt !== undefined ? { deadlineRemindAt } : {}),
-      },
-    },
-  };
-};
-
-const firstRejectedField = (body: Record<string, unknown>): string | undefined =>
-  REJECTED_TASK_FIELDS.find((field) => field in body);
-
-const getQueryParam = (
-  query: Record<string, string | string[]>,
-  key: string,
-): string | undefined => {
-  const value = query[key];
-  if (value === undefined) return undefined;
-  return Array.isArray(value) ? value[0] : value;
-};
-
-const getQueryParamAsBoolean = (
-  query: Record<string, string | string[]>,
-  key: string,
-  defaultValue: boolean,
-): boolean => {
-  const value = getQueryParam(query, key);
-  if (value === undefined) return defaultValue;
-  return value.toLowerCase() === 'true';
-};
-
-const createErrorResponse = (
-  requestId: string,
-  status: number,
-  code: string,
-  message: string,
-  details?: unknown,
-): LocalRestApiResponsePayload => ({
-  requestId,
-  status,
-  body: {
-    ok: false,
-    error: {
-      code,
-      message,
-      details,
-    },
-  },
-});
-
-const createSuccessResponse = (
-  requestId: string,
-  status: number,
-  data: unknown,
-): LocalRestApiResponsePayload => ({
-  requestId,
-  status,
-  body: {
-    ok: true,
-    data,
-  },
-});
-
-type TaskSource = 'active' | 'archived' | 'all';
-
-const isValidTimestamp = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isFinite(value) && new Date(value).getTime() > 0;
-
-const isTaskInToday = (
-  task: Task,
-  todayStr: string,
-  startOfNextDayDiffMs: number,
-): boolean => {
-  if (isValidTimestamp(task.dueWithTime)) {
-    return isTodayWithOffset(task.dueWithTime, todayStr, startOfNextDayDiffMs);
-  }
-  return task.dueDay === todayStr;
-};
+import {
+  isRecord,
+  DeadlineChange,
+  resolveDeadlineChange,
+  validateDeadlineFields,
+  hasOwn,
+  DEADLINE_FIELDS,
+  WritableTaskFields,
+  pickAllowedFields,
+  validateWritableFields,
+  firstRejectedField,
+  SUBTASK_INHERITED_FIELDS,
+  pickAllowedProjectFields,
+  validateWritableProjectFields,
+  pickAllowedTagFields,
+  validateWritableTagFields,
+  pickAllowedNoteFields,
+  validateWritableNoteFields,
+  pickAllowedTaskRepeatCfgFields,
+  validateWritableTaskRepeatCfgFields,
+  getQueryParam,
+  getQueryParamAsBoolean,
+  createErrorResponse,
+  createSuccessResponse,
+  TaskSource,
+  isTaskInToday,
+} from './local-rest-api-handler.utils';
 
 @Injectable({
   providedIn: 'root',
@@ -358,6 +66,8 @@ export class LocalRestApiHandlerService {
   private readonly _taskArchiveService = inject(TaskArchiveService);
   private readonly _projectService = inject(ProjectService);
   private readonly _tagService = inject(TagService);
+  private readonly _noteService = inject(NoteService);
+  private readonly _taskRepeatCfgService = inject(TaskRepeatCfgService);
   private readonly _dateService = inject(DateService);
   private readonly _store = inject(Store);
   private _isInitialized = false;
@@ -459,8 +169,64 @@ export class LocalRestApiHandlerService {
       return this._handleListProjects(requestId, query);
     }
 
+    if (method === 'POST' && path === '/projects') {
+      return this._handleCreateProject(requestId, body);
+    }
+
+    if (segments[0] === 'projects' && segments[1] && segments.length === 2) {
+      if (method === 'DELETE') {
+        return this._handleDeleteProject(requestId, segments[1]);
+      }
+      if (method === 'PATCH') {
+        return this._handleUpdateProject(requestId, segments[1], body);
+      }
+    }
+
     if (method === 'GET' && path === '/tags') {
       return this._handleListTags(requestId, query);
+    }
+
+    if (method === 'POST' && path === '/tags') {
+      return this._handleCreateTag(requestId, body);
+    }
+
+    if (segments[0] === 'tags' && segments[1] && segments.length === 2) {
+      if (method === 'PATCH') {
+        return this._handleUpdateTag(requestId, segments[1], body);
+      }
+      if (method === 'DELETE') {
+        return this._handleDeleteTag(requestId, segments[1]);
+      }
+    }
+
+    if (method === 'GET' && path === '/notes') {
+      return this._handleListNotes(requestId, query);
+    }
+
+    if (method === 'POST' && path === '/notes') {
+      return this._handleCreateNote(requestId, body);
+    }
+
+    if (segments[0] === 'notes' && segments[1] && segments.length === 2) {
+      if (method === 'PATCH') {
+        return this._handleUpdateNote(requestId, segments[1], body);
+      }
+      if (method === 'DELETE') {
+        return this._handleDeleteNote(requestId, segments[1]);
+      }
+    }
+
+    if (method === 'GET' && path === '/task-repeat-configs') {
+      return this._handleListTaskRepeatCfgs(requestId, query);
+    }
+
+    if (segments[0] === 'task-repeat-configs' && segments[1] && segments.length === 2) {
+      if (method === 'PATCH') {
+        return this._handleUpdateTaskRepeatCfg(requestId, segments[1], body);
+      }
+      if (method === 'DELETE') {
+        return this._handleDeleteTaskRepeatCfg(requestId, segments[1]);
+      }
     }
 
     return createErrorResponse(requestId, 404, 'NOT_FOUND', 'Route not found');
@@ -569,6 +335,7 @@ export class LocalRestApiHandlerService {
     const queryText = getQueryParam(query, 'query');
     const projectId = getQueryParam(query, 'projectId');
     const tagId = getQueryParam(query, 'tagId');
+    const overdue = getQueryParamAsBoolean(query, 'overdue', false);
     const includeDone = getQueryParamAsBoolean(query, 'includeDone', false);
     const VALID_SOURCES: TaskSource[] = ['active', 'archived', 'all'];
     const rawSource = getQueryParam(query, 'source') || 'active';
@@ -604,6 +371,12 @@ export class LocalRestApiHandlerService {
       filtered = filtered.filter((t) => isTaskInToday(t, todayStr, startOfNextDayDiffMs));
     } else if (tagId) {
       filtered = filtered.filter((t) => t.tagIds.includes(tagId));
+    }
+
+    if (overdue) {
+      const todayStr = this._dateService.todayStr();
+      const startOfNextDayDiffMs = this._dateService.getStartOfNextDayDiffMs();
+      filtered = filtered.filter((t) => isTaskOverdue(t, todayStr, startOfNextDayDiffMs));
     }
 
     if (!includeDone) {
@@ -961,6 +734,133 @@ export class LocalRestApiHandlerService {
     return createSuccessResponse(requestId, 200, projects);
   }
 
+  /**
+   * Only `title` is writable on project creation via the REST API — every
+   * other Project field (theme, taskIds, advancedCfg, ...) is either
+   * derived/managed by the app or has no legitimate external write path, so
+   * this mirrors ALLOWED_TASK_FIELDS' minimal-surface approach rather than
+   * exposing Partial<Project> wholesale.
+   */
+  private async _handleCreateProject(
+    requestId: string,
+    body: unknown,
+  ): Promise<LocalRestApiResponsePayload> {
+    if (!isRecord(body) || typeof body.title !== 'string' || !body.title.trim()) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'Project title must be a non-empty string',
+      );
+    }
+
+    const title = body.title.trim();
+    const projectId = this._projectService.add({ title });
+    const created = await firstValueFrom(
+      this._projectService.getByIdOnceCatchError$(projectId),
+    );
+
+    return createSuccessResponse(requestId, 201, created);
+  }
+
+  /**
+   * Refuses to delete a non-empty project rather than silently cascading the
+   * deletion onto its tasks — REST API callers have no task-level visibility
+   * into what "delete project" would take with it, so an empty check keeps
+   * this a safe, narrow-scope operation instead of a hidden bulk-delete.
+   */
+  private async _handleDeleteProject(
+    requestId: string,
+    projectId: string,
+  ): Promise<LocalRestApiResponsePayload> {
+    if (projectId === 'INBOX_PROJECT') {
+      return createErrorResponse(
+        requestId,
+        400,
+        'UNSUPPORTED_FIELD',
+        'The Inbox project cannot be deleted',
+      );
+    }
+
+    const project = await firstValueFrom(
+      this._projectService.getByIdOnceCatchError$(projectId),
+    );
+    if (!project || project.id !== projectId) {
+      return createErrorResponse(
+        requestId,
+        404,
+        'PROJECT_NOT_FOUND',
+        'Project not found',
+      );
+    }
+
+    if (project.taskIds.length > 0 || project.backlogTaskIds.length > 0) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'PROJECT_NOT_EMPTY',
+        'Project has tasks — move or delete them first, then delete the project',
+      );
+    }
+
+    await this._projectService.remove(project);
+    return createSuccessResponse(requestId, 200, { deleted: true, id: projectId });
+  }
+
+  private async _handleUpdateProject(
+    requestId: string,
+    projectId: string,
+    body: unknown,
+  ): Promise<LocalRestApiResponsePayload> {
+    if (!isRecord(body)) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'PATCH body must be a JSON object',
+      );
+    }
+
+    if ('title' in body && (typeof body.title !== 'string' || !body.title.trim())) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'title must be a non-empty string',
+      );
+    }
+
+    const changes = pickAllowedProjectFields(body);
+    const validation = validateWritableProjectFields(changes);
+    if (!validation.ok) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'One or more project fields have an invalid type',
+        validation.errors,
+      );
+    }
+
+    const project = await firstValueFrom(
+      this._projectService.getByIdOnceCatchError$(projectId),
+    );
+    if (!project || project.id !== projectId) {
+      return createErrorResponse(
+        requestId,
+        404,
+        'PROJECT_NOT_FOUND',
+        'Project not found',
+      );
+    }
+
+    this._projectService.update(projectId, changes);
+    const updated = await firstValueFrom(
+      this._projectService.getByIdOnceCatchError$(projectId),
+    );
+    return createSuccessResponse(requestId, 200, updated);
+  }
+
   private async _handleListTags(
     requestId: string,
     query: Record<string, string | string[]>,
@@ -975,6 +875,297 @@ export class LocalRestApiHandlerService {
     }
 
     return createSuccessResponse(requestId, 200, tags);
+  }
+
+  private async _handleCreateTag(
+    requestId: string,
+    body: unknown,
+  ): Promise<LocalRestApiResponsePayload> {
+    if (!isRecord(body) || typeof body.title !== 'string' || !body.title.trim()) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'Tag title must be a non-empty string',
+      );
+    }
+
+    const additionalFields = pickAllowedTagFields(body);
+    const validation = validateWritableTagFields(additionalFields);
+    if (!validation.ok) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'One or more tag fields have an invalid type',
+        validation.errors,
+      );
+    }
+
+    const tagId = this._tagService.addTag({
+      title: body.title.trim(),
+      ...additionalFields,
+    });
+    const created = await firstValueFrom(this._tagService.getTagById$(tagId));
+    return createSuccessResponse(requestId, 201, created);
+  }
+
+  private async _handleUpdateTag(
+    requestId: string,
+    tagId: string,
+    body: unknown,
+  ): Promise<LocalRestApiResponsePayload> {
+    if (tagId === TODAY_TAG.id) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'UNSUPPORTED_FIELD',
+        'The Today tag is virtual and cannot be modified',
+      );
+    }
+
+    if (!isRecord(body)) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'PATCH body must be a JSON object',
+      );
+    }
+
+    if ('title' in body && (typeof body.title !== 'string' || !body.title.trim())) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'title must be a non-empty string',
+      );
+    }
+
+    const changes = pickAllowedTagFields(body);
+    const validation = validateWritableTagFields(changes);
+    if (!validation.ok) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'One or more tag fields have an invalid type',
+        validation.errors,
+      );
+    }
+
+    const tag = await firstValueFrom(this._tagService.getTagById$(tagId));
+    if (!tag || tag.id !== tagId) {
+      return createErrorResponse(requestId, 404, 'TAG_NOT_FOUND', 'Tag not found');
+    }
+
+    this._tagService.updateTag(tagId, changes);
+    const updated = await firstValueFrom(this._tagService.getTagById$(tagId));
+    return createSuccessResponse(requestId, 200, updated);
+  }
+
+  private async _handleDeleteTag(
+    requestId: string,
+    tagId: string,
+  ): Promise<LocalRestApiResponsePayload> {
+    if (tagId === TODAY_TAG.id) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'UNSUPPORTED_FIELD',
+        'The Today tag is virtual and cannot be deleted',
+      );
+    }
+
+    const tag = await firstValueFrom(this._tagService.getTagById$(tagId));
+    if (!tag || tag.id !== tagId) {
+      return createErrorResponse(requestId, 404, 'TAG_NOT_FOUND', 'Tag not found');
+    }
+
+    this._tagService.deleteTag(tagId);
+    return createSuccessResponse(requestId, 200, { deleted: true, id: tagId });
+  }
+
+  private async _handleListNotes(
+    requestId: string,
+    query: Record<string, string | string[]>,
+  ): Promise<LocalRestApiResponsePayload> {
+    const projectId = getQueryParam(query, 'projectId');
+    let notes = await firstValueFrom(this._noteService.notes$);
+
+    if (projectId) {
+      notes = notes.filter((n) => n.projectId === projectId);
+    }
+
+    return createSuccessResponse(requestId, 200, notes);
+  }
+
+  private async _handleCreateNote(
+    requestId: string,
+    body: unknown,
+  ): Promise<LocalRestApiResponsePayload> {
+    if (!isRecord(body) || typeof body.content !== 'string' || !body.content.trim()) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'Note content must be a non-empty string',
+      );
+    }
+
+    const additionalFields = pickAllowedNoteFields(body);
+    const validation = validateWritableNoteFields(additionalFields);
+    if (!validation.ok) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'One or more note fields have an invalid type',
+        validation.errors,
+      );
+    }
+
+    const id = nanoid();
+    this._noteService.add({ id, ...additionalFields, content: body.content });
+    const created = await firstValueFrom(this._noteService.getByIdOnce$(id));
+    return createSuccessResponse(requestId, 201, created);
+  }
+
+  private async _handleUpdateNote(
+    requestId: string,
+    noteId: string,
+    body: unknown,
+  ): Promise<LocalRestApiResponsePayload> {
+    if (!isRecord(body)) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'PATCH body must be a JSON object',
+      );
+    }
+
+    if ('content' in body && typeof body.content !== 'string') {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'content must be a string',
+      );
+    }
+
+    const changes = pickAllowedNoteFields(body);
+    const validation = validateWritableNoteFields(changes);
+    if (!validation.ok) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'One or more note fields have an invalid type',
+        validation.errors,
+      );
+    }
+
+    const note = await firstValueFrom(this._noteService.getByIdOnce$(noteId));
+    if (!note || note.id !== noteId) {
+      return createErrorResponse(requestId, 404, 'NOTE_NOT_FOUND', 'Note not found');
+    }
+
+    this._noteService.update(noteId, changes);
+    const updated = await firstValueFrom(this._noteService.getByIdOnce$(noteId));
+    return createSuccessResponse(requestId, 200, updated);
+  }
+
+  private async _handleDeleteNote(
+    requestId: string,
+    noteId: string,
+  ): Promise<LocalRestApiResponsePayload> {
+    const note = await firstValueFrom(this._noteService.getByIdOnce$(noteId));
+    if (!note || note.id !== noteId) {
+      return createErrorResponse(requestId, 404, 'NOTE_NOT_FOUND', 'Note not found');
+    }
+
+    this._noteService.remove(note);
+    return createSuccessResponse(requestId, 200, { deleted: true, id: noteId });
+  }
+
+  private async _handleListTaskRepeatCfgs(
+    requestId: string,
+    query: Record<string, string | string[]>,
+  ): Promise<LocalRestApiResponsePayload> {
+    const projectId = getQueryParam(query, 'projectId');
+    let cfgs = await firstValueFrom(this._taskRepeatCfgService.taskRepeatCfgs$);
+
+    if (projectId) {
+      cfgs = cfgs.filter((c) => c.projectId === projectId);
+    }
+
+    return createSuccessResponse(requestId, 200, cfgs);
+  }
+
+  private async _handleUpdateTaskRepeatCfg(
+    requestId: string,
+    cfgId: string,
+    body: unknown,
+  ): Promise<LocalRestApiResponsePayload> {
+    if (!isRecord(body)) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'PATCH body must be a JSON object',
+      );
+    }
+
+    const changes = pickAllowedTaskRepeatCfgFields(body);
+    const validation = validateWritableTaskRepeatCfgFields(changes);
+    if (!validation.ok) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'One or more task-repeat-cfg fields have an invalid type',
+        validation.errors,
+      );
+    }
+
+    const cfg = await firstValueFrom(
+      this._taskRepeatCfgService.getTaskRepeatCfgByIdAllowUndefined$(cfgId),
+    );
+    if (!cfg || cfg.id !== cfgId) {
+      return createErrorResponse(
+        requestId,
+        404,
+        'TASK_REPEAT_CFG_NOT_FOUND',
+        'Task-repeat-cfg not found',
+      );
+    }
+
+    this._taskRepeatCfgService.updateTaskRepeatCfg(cfgId, changes, false);
+    const updated = await firstValueFrom(
+      this._taskRepeatCfgService.getTaskRepeatCfgByIdAllowUndefined$(cfgId),
+    );
+    return createSuccessResponse(requestId, 200, updated);
+  }
+
+  private async _handleDeleteTaskRepeatCfg(
+    requestId: string,
+    cfgId: string,
+  ): Promise<LocalRestApiResponsePayload> {
+    const cfg = await firstValueFrom(
+      this._taskRepeatCfgService.getTaskRepeatCfgByIdAllowUndefined$(cfgId),
+    );
+    if (!cfg || cfg.id !== cfgId) {
+      return createErrorResponse(
+        requestId,
+        404,
+        'TASK_REPEAT_CFG_NOT_FOUND',
+        'Task-repeat-cfg not found',
+      );
+    }
+
+    this._taskRepeatCfgService.deleteTaskRepeatCfg(cfgId);
+    return createSuccessResponse(requestId, 200, { deleted: true, id: cfgId });
   }
 
   // The id equality checks reject prototype-property names ('constructor',
