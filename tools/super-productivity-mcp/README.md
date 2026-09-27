@@ -2,7 +2,7 @@
 
 This is a narrow, standard-stdio MCP server over Super Productivity's local REST API. It does not open a network listener, read the task database, execute shell commands, or expose arbitrary REST paths.
 
-Set `SUPER_PRODUCTIVITY_API_TOKEN` only in the process environment; never commit it. `SUPER_PRODUCTIVITY_API_URL` defaults to `http://127.0.0.1:3876` and should stay loopback-only.
+Set `SUPER_PRODUCTIVITY_API_TOKEN` only in the process environment, or point `SUPER_PRODUCTIVITY_API_TOKEN_FILE` at the desktop app's token file (`~/Library/Application Support/superProductivity/local-rest-api-token` on macOS); never commit the token. `SUPER_PRODUCTIVITY_API_URL` defaults to `http://127.0.0.1:3876` and should stay loopback-only.
 
 Run it after enabling the desktop app's Local REST API:
 

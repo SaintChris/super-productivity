@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 /**
  * Narrow stdio MCP adapter for Super Productivity's local REST API.
- * The token is accepted only through SUPER_PRODUCTIVITY_API_TOKEN at runtime.
+ * The token is accepted at runtime through SUPER_PRODUCTIVITY_API_TOKEN, or read from
+ * the file named by SUPER_PRODUCTIVITY_API_TOKEN_FILE.
  */
+import { readFileSync } from 'node:fs';
 import readline from 'node:readline';
 
 const baseUrl = process.env.SUPER_PRODUCTIVITY_API_URL || 'http://127.0.0.1:3876';
-const token = process.env.SUPER_PRODUCTIVITY_API_TOKEN;
+const tokenFile = process.env.SUPER_PRODUCTIVITY_API_TOKEN_FILE;
+const token =
+  process.env.SUPER_PRODUCTIVITY_API_TOKEN ||
+  (tokenFile ? readFileSync(tokenFile, 'utf8').trim() : undefined);
 const priorityTags = new Set(['EM_URGENT', 'EM_IMPORTANT']);
 
 const fail = (message, details) => ({
@@ -103,7 +108,10 @@ const tools = [
 ];
 
 const api = async (path, options = {}) => {
-  if (!token) throw new Error('SUPER_PRODUCTIVITY_API_TOKEN is required');
+  if (!token)
+    throw new Error(
+      'SUPER_PRODUCTIVITY_API_TOKEN or SUPER_PRODUCTIVITY_API_TOKEN_FILE is required',
+    );
   const response = await fetch(new URL(path, baseUrl), {
     ...options,
     headers: {
