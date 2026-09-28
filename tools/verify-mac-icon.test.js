@@ -21,6 +21,18 @@ const { compareIconsets, verifyIconset, verifyIcns } = require('./verify-mac-ico
 const ICON_PATH = join(__dirname, '..', 'build', 'icon.icns');
 const ICONSET_PATH = join(__dirname, '..', 'build', 'icon.iconset');
 const GENERIC_SMALL_ICON = join(__dirname, '..', 'build', 'icons', '16x16.png');
+const SMALL_ICON_TYPES = ['icp4', 'ic04'];
+
+const findChunkOffset = (icns, types) => {
+  let offset = 8;
+  while (offset < icns.length) {
+    if (types.includes(icns.toString('ascii', offset, offset + 4))) {
+      return offset;
+    }
+    offset += icns.readUInt32BE(offset + 4);
+  }
+  return -1;
+};
 
 test('macOS icon generator launches npm through Node on Windows', () => {
   const npmExecPath = String.raw`C:\Program Files\nodejs\node_modules\npm\bin\npm-cli.js`;
@@ -46,9 +58,12 @@ test('checked-in macOS icon sources contain every standard representation', () =
 
 test('macOS icon verification rejects unrecognized small-icon payloads', () => {
   const mangledIcon = Buffer.from(readFileSync(ICON_PATH));
-  assert.equal(mangledIcon.toString('ascii', 8, 12), 'icp4');
-  mangledIcon.write('ic04', 8, 4, 'ascii');
-  mangledIcon.fill(0, 16, 24);
+  // The 16x16 slot is icp4 (PNG) upstream, but newer iconutil builds emit it
+  // as ic04 (ARGB), so locate whichever one the checked-in icon uses.
+  const smallIconOffset = findChunkOffset(mangledIcon, SMALL_ICON_TYPES);
+  assert.notEqual(smallIconOffset, -1);
+  mangledIcon.write('ic04', smallIconOffset, 4, 'ascii');
+  mangledIcon.fill(0, smallIconOffset + 8, smallIconOffset + 16);
 
   assert.throws(
     () => verifyIcns(mangledIcon, 'mangled.icns', ICONSET_PATH),
@@ -178,7 +193,7 @@ const buildIcnsWithArgbSmallIcon = (pixels) => {
     const length = source.readUInt32BE(offset + 4);
     // iconutil emits the 16x16 slot as ic04 with ARGB data; mirror that shape.
     chunks.push(
-      type === 'icp4'
+      SMALL_ICON_TYPES.includes(type)
         ? { type: 'ic04', data: argbData }
         : { type, data: source.subarray(offset + 8, offset + length) },
     );
