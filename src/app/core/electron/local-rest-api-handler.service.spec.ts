@@ -9,6 +9,8 @@ import { Project } from '../../features/project/project.model';
 import { TagService } from '../../features/tag/tag.service';
 import { TODAY_TAG } from '../../features/tag/tag.const';
 import { DateService } from '../date/date.service';
+import { NoteService } from '../../features/note/note.service';
+import { TaskRepeatCfgService } from '../../features/task-repeat-cfg/task-repeat-cfg.service';
 import { Task, TaskWithSubTasks, TaskArchive } from '../../features/tasks/task.model';
 import {
   LocalRestApiRequestPayload,
@@ -218,6 +220,17 @@ describe('LocalRestApiHandlerService', () => {
         { provide: ProjectService, useValue: projectServiceMock },
         { provide: TagService, useValue: tagServiceMock },
         { provide: DateService, useValue: dateServiceMock },
+        {
+          provide: NoteService,
+          useValue: jasmine.createSpyObj('NoteService', ['add', 'update', 'remove'], {
+            notes$: of([]),
+            getByIdOnce$: (_id: string) => of(undefined),
+          }),
+        },
+        {
+          provide: TaskRepeatCfgService,
+          useValue: { taskRepeatCfgs$: of([]) },
+        },
         provideMockStore({ initialState: { focusMode: initialFocusModeState } }),
       ],
     });
