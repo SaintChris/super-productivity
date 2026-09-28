@@ -56,7 +56,9 @@ import {
   createSuccessResponse,
   TaskSource,
   isTaskInToday,
+  parseAddTimeSpentBody,
 } from './local-rest-api-handler.utils';
+import { syncTimeSpent } from '../../features/time-tracking/store/time-tracking.actions';
 
 @Injectable({
   providedIn: 'root',
@@ -661,6 +663,19 @@ export class LocalRestApiHandlerService {
 
       this._taskService.setCurrentId(taskId);
       return createSuccessResponse(requestId, 200, { currentTaskId: taskId });
+    }
+
+    if (segments.length === 3 && segments[2] === 'time' && method === 'POST') {
+      const task = await this._getTaskById(taskId);
+      const parsed = parseAddTimeSpentBody(body);
+      if (!task)
+        return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
+      if ('error' in parsed)
+        return createErrorResponse(requestId, 400, 'INVALID_INPUT', parsed.error);
+      // Same pair as TaskService.addTimeSpentAndSync, but for any day.
+      this._taskService.addTimeSpent(task, parsed.duration, parsed.date);
+      this._store.dispatch(syncTimeSpent({ taskId, ...parsed }));
+      return createSuccessResponse(requestId, 200, await this._getTaskById(taskId));
     }
 
     if (segments.length === 3 && segments[2] === 'archive' && method === 'POST') {

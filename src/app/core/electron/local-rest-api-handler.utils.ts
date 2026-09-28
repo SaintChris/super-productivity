@@ -527,3 +527,34 @@ export const resolveDeadlineChange = (
     },
   };
 };
+
+const MAX_ADD_TIME_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Validates `POST /tasks/:id/time` bodies: `{ date: 'YYYY-MM-DD', duration: ms }`.
+ * Returns the parsed values, or an error message for a 400 response.
+ */
+export const parseAddTimeSpentBody = (
+  body: unknown,
+): { date: string; duration: number } | { error: string } => {
+  if (!isRecord(body)) {
+    return { error: 'Body must be an object with date and duration' };
+  }
+  const { date, duration } = body;
+  if (
+    typeof date !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
+    Number.isNaN(Date.parse(`${date}T00:00:00Z`))
+  ) {
+    return { error: 'date must be a valid YYYY-MM-DD string' };
+  }
+  if (
+    typeof duration !== 'number' ||
+    !Number.isInteger(duration) ||
+    duration <= 0 ||
+    duration > MAX_ADD_TIME_MS
+  ) {
+    return { error: 'duration must be a positive integer of milliseconds, at most 24h' };
+  }
+  return { date, duration };
+};
