@@ -21,7 +21,8 @@ const fail = (message, details) => ({
 });
 const ok = (data) => ({
   content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
-  structuredContent: data,
+  // MCP structuredContent must be an object; Claude Code rejects bare arrays.
+  structuredContent: Array.isArray(data) ? { items: data } : data,
 });
 const schema = (properties, required = []) => ({
   type: 'object',
