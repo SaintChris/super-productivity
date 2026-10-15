@@ -13,6 +13,7 @@ import {
   PluginHeaderBtnCfg,
   PluginHookHandler,
   PluginMenuEntryCfg,
+  PluginTaskContextMenuEntryCfg,
   PluginNodeScriptRequest,
   PluginNodeScriptResult,
   PluginShortcutCfg,
@@ -44,6 +45,7 @@ import {
 import { snackCfgToSnackParams } from './plugin-api-mapper';
 import { PluginHooksService } from './plugin-hooks';
 import { TaskService } from '../features/tasks/task.service';
+import { TaskMoveToProjectService } from '../features/tasks/task-move-to-project.service';
 import { getDomFocusedTaskId } from '../features/tasks/get-dom-focused-task-id';
 import { addSubTask } from '../features/tasks/store/task.actions';
 import { selectTaskFeatureState } from '../features/tasks/store/task.selectors';
@@ -90,6 +92,7 @@ import { PluginSecretService } from './secret/plugin-secret.service';
 import { ISSUE_PROVIDER_TYPES } from '../features/issue/issue.const';
 import { PluginService } from './plugin.service';
 import { PluginI18nService } from './plugin-i18n.service';
+import { PluginTaskContextMenuRegistryService } from './plugin-task-context-menu-registry.service';
 import { formatDateForPlugin } from './plugin-i18n-date.util';
 
 /**
@@ -167,6 +170,7 @@ export class PluginBridgeService implements OnDestroy {
   private _pluginSecretService = inject(PluginSecretService);
   private _dataInitService = inject(DataInitService);
   private _globalConfigService = inject(GlobalConfigService);
+  private _taskContextMenuRegistry = inject(PluginTaskContextMenuRegistryService);
   readonly #nodeExecutionGrantTokens = new Map<string, string>();
   readonly #nodeExecutionApi = this._consumeNodeExecutionApi();
 
@@ -244,6 +248,7 @@ export class PluginBridgeService implements OnDestroy {
     downloadFile: (filename: string, data: string) => Promise<void>;
     registerHeaderButton: (cfg: PluginHeaderBtnCfg) => void;
     registerMenuEntry: (cfg: Omit<PluginMenuEntryCfg, 'pluginId'>) => void;
+    registerTaskContextMenuEntry: (cfg: PluginTaskContextMenuEntryCfg) => void;
     registerSidePanelButton: (cfg: Omit<PluginSidePanelBtnCfg, 'pluginId'>) => void;
     registerWorkContextHeaderButton: (
       cfg: Omit<PluginWorkContextHeaderBtnCfg, 'pluginId'>,
@@ -308,6 +313,8 @@ export class PluginBridgeService implements OnDestroy {
         this._registerHeaderButton(pluginId, cfg),
       registerMenuEntry: (cfg: Omit<PluginMenuEntryCfg, 'pluginId'>) =>
         this._registerMenuEntry(pluginId, cfg),
+      registerTaskContextMenuEntry: (cfg: PluginTaskContextMenuEntryCfg) =>
+        this._taskContextMenuRegistry.register(pluginId, cfg),
       registerSidePanelButton: (cfg: Omit<PluginSidePanelBtnCfg, 'pluginId'>) =>
         this._registerSidePanelButton(pluginId, cfg),
       registerWorkContextHeaderButton: (
@@ -456,9 +463,10 @@ export class PluginBridgeService implements OnDestroy {
     }
 
     const issueProviderCfg = manifest?.issueProvider;
+    const isBundled = this._isPluginBundled(pluginId);
     const customKey = issueProviderCfg?.issueProviderKey;
-    if (customKey && (ISSUE_PROVIDER_TYPES as readonly string[]).includes(customKey)) {
-      throw new Error(`Plugin cannot register under built-in key "${customKey}"`);
+    if (customKey && (!isBundled || ISSUE_PROVIDER_TYPES.some((k) => k === customKey))) {
+      throw new Error(`Plugin cannot register under reserved key "${customKey}"`);
     }
     const name = manifest?.name ?? pluginId;
     const humanReadableName = issueProviderCfg?.humanReadableName ?? name;
@@ -483,8 +491,7 @@ export class PluginBridgeService implements OnDestroy {
       issueProviderKey: customKey,
       useAgendaView: issueProviderCfg?.useAgendaView,
       defaultAutoAddToBacklog: issueProviderCfg?.defaultAutoAddToBacklog,
-      allowPrivateNetwork:
-        issueProviderCfg?.allowPrivateNetwork && this._isPluginBundled(pluginId),
+      allowPrivateNetwork: issueProviderCfg?.allowPrivateNetwork && isBundled,
     });
 
     const registeredKey = this._pluginIssueProviderRegistry.getRegisteredKey(pluginId);
@@ -916,19 +923,12 @@ export class PluginBridgeService implements OnDestroy {
         );
       }
 
-      if (taskWithSubTasks.projectId === projectId) {
-        PluginLog.log('PluginBridge: Task already in target project', {
-          taskId,
-          projectId,
-        });
-      } else {
-        this._taskService.moveToProject(taskWithSubTasks, projectId);
-
-        PluginLog.log('PluginBridge: Task moved to project successfully', {
-          taskId,
-          projectId,
-        });
-      }
+      // Same path as a UI move so a recurring task's config and instances follow
+      // it; a plugin has no user to answer the confirm dialog (#10489).
+      const isMoved = await this._injector
+        .get(TaskMoveToProjectService)
+        .moveToProject(taskWithSubTasks, projectId, { isSkipConfirm: true });
+      PluginLog.log('PluginBridge: Task move to project', { taskId, projectId, isMoved });
     }
 
     if (Object.keys(otherUpdates).length > 0) {
@@ -1194,6 +1194,7 @@ export class PluginBridgeService implements OnDestroy {
       PluginLog.log('PluginBridge: Validating task reorder', {
         requestedTaskIds: taskIds,
         projectTaskIds: allProjectTaskIds,
+        // eslint-disable-next-line local-rules/no-user-content-in-logs -- grandfathered log baseline (2026-09), not yet triaged
         actualTasksInProject: taskIdsInProject,
         projectId: contextId,
       });
@@ -1470,6 +1471,7 @@ export class PluginBridgeService implements OnDestroy {
     this._removePluginMenuEntries(pluginId);
     this._removePluginSidePanelButtons(pluginId);
     this._removePluginWorkContextHeaderButtons(pluginId);
+    this._taskContextMenuRegistry.unregisterPlugin(pluginId);
     this.unregisterPluginShortcuts(pluginId);
     this._configHandlers.delete(pluginId);
 
@@ -1505,6 +1507,7 @@ export class PluginBridgeService implements OnDestroy {
 
     PluginLog.log('PluginBridge: Header button registered', {
       pluginId,
+      // eslint-disable-next-line local-rules/no-user-content-in-logs -- grandfathered log baseline (2026-09), not yet triaged
       headerBtnCfg,
     });
   }
@@ -1558,6 +1561,7 @@ export class PluginBridgeService implements OnDestroy {
 
     PluginLog.log('PluginBridge: Menu entry registered', {
       pluginId,
+      // eslint-disable-next-line local-rules/no-user-content-in-logs -- grandfathered log baseline (2026-09), not yet triaged
       menuEntryCfg,
     });
   }
@@ -1623,11 +1627,7 @@ export class PluginBridgeService implements OnDestroy {
    * Remove all header buttons for a specific plugin
    */
   private _removePluginHeaderButtons(pluginId: string): void {
-    const currentButtons = this._headerButtons();
-    const filteredButtons = currentButtons.filter(
-      (button) => button.pluginId !== pluginId,
-    );
-    this._headerButtons.set(filteredButtons);
+    this._headerButtons.update((bs) => bs.filter((b) => b.pluginId !== pluginId));
 
     PluginLog.log('PluginBridge: Header buttons removed for plugin', { pluginId });
   }
@@ -1644,9 +1644,7 @@ export class PluginBridgeService implements OnDestroy {
    * Remove all menu entries for a specific plugin
    */
   private _removePluginMenuEntries(pluginId: string): void {
-    const currentEntries = this._menuEntries();
-    const filteredEntries = currentEntries.filter((entry) => entry.pluginId !== pluginId);
-    this._menuEntries.set(filteredEntries);
+    this._menuEntries.update((entries) => entries.filter((e) => e.pluginId !== pluginId));
 
     PluginLog.log('PluginBridge: Menu entries removed for plugin', { pluginId });
   }
@@ -1695,6 +1693,7 @@ export class PluginBridgeService implements OnDestroy {
 
     PluginLog.log('PluginBridge: Side panel button registered', {
       pluginId,
+      // eslint-disable-next-line local-rules/no-user-content-in-logs -- grandfathered log baseline (2026-09), not yet triaged
       sidePanelBtnCfg,
     });
   }
@@ -1703,11 +1702,7 @@ export class PluginBridgeService implements OnDestroy {
    * Remove all side panel buttons for a specific plugin
    */
   private _removePluginSidePanelButtons(pluginId: string): void {
-    const currentButtons = this._sidePanelButtons();
-    const filteredButtons = currentButtons.filter(
-      (button) => button.pluginId !== pluginId,
-    );
-    this._sidePanelButtons.set(filteredButtons);
+    this._sidePanelButtons.update((bs) => bs.filter((b) => b.pluginId !== pluginId));
 
     PluginLog.log('PluginBridge: Side panel buttons removed for plugin', { pluginId });
   }
@@ -2070,7 +2065,7 @@ export class PluginBridgeService implements OnDestroy {
   /**
    * Track window focus state
    */
-  private _isWindowFocused = true;
+  private _isWindowFocused = document.hasFocus(); // hidden/tray start: no blur event
   private _windowFocusHandlers = new Map<string, (isFocused: boolean) => void>();
 
   // Named listener methods for proper cleanup
@@ -2085,7 +2080,7 @@ export class PluginBridgeService implements OnDestroy {
   };
 
   private _onVisibilityChange = (): void => {
-    const isFocused = !document.hidden;
+    const isFocused = !document.hidden && document.hasFocus();
     this._isWindowFocused = isFocused;
     this._notifyFocusHandlers(isFocused);
   };

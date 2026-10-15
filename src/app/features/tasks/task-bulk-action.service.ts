@@ -11,7 +11,7 @@ import { SnackService } from '../../core/snack/snack.service';
 import { DateService } from '../../core/date/date.service';
 import { GlobalConfigService } from '../config/global-config.service';
 import { WorkContextService } from '../work-context/work-context.service';
-import { Task, TaskReminderOptionId, TaskWithSubTasks } from './task.model';
+import { Task, TaskPriority, TaskReminderOptionId, TaskWithSubTasks } from './task.model';
 import {
   selectTaskEntities,
   selectTaskByIdWithSubTaskData,
@@ -41,6 +41,7 @@ import {
   resolveTagIntent,
   splitParentOnly,
 } from './task-bulk-action.util';
+import { TASK_PRIORITY_LABEL_KEY, getTaskPriority } from './task-priority.const';
 import { isTouchActive } from '../../util/input-intent';
 import { LocaleDatePipe } from '../../ui/pipes/locale-date.pipe';
 import { msToString } from '../../ui/duration/ms-to-string.pipe';
@@ -155,8 +156,10 @@ export class TaskBulkActionService {
 
   /**
    * More than one task always confirms, regardless of `isConfirmBeforeDelete`:
-   * there is no undo for a bulk delete yet. A single selected task takes the
-   * normal single-task path (setting + undo snack).
+   * there is no undo for a bulk delete yet. For the same reason that confirm
+   * keeps the default initial focus on Cancel, so Delete then Enter cannot
+   * remove a whole selection. A single selected task takes the normal
+   * single-task path (setting + undo snack).
    *
    * Top-level tasks go through `deleteTasks` in one op. A subtask whose parent
    * survives goes through the singular `deleteTask` instead: older clients'
@@ -216,6 +219,7 @@ export class TaskBulkActionService {
             data: {
               okTxt: T.F.TASK.D_CONFIRM_DELETE.OK,
               message: T.F.TASK.D_CONFIRM_DELETE.MSG,
+              isFocusConfirm: true,
               translateParams: { title: truncate(task.title) },
             },
           })
@@ -237,9 +241,14 @@ export class TaskBulkActionService {
 
   // ---- PROJECT ----------------------------------------------------------
 
-  async moveToProject(projectId: string): Promise<void> {
+  async moveToProject(projectId: string, taskIds?: readonly string[]): Promise<void> {
+    const resolved = taskIds
+      ? taskIds
+          .map((id) => this._taskEntities()[id])
+          .filter((task): task is Task => !!task)
+      : this._resolveInVisualOrder();
     const { eligible, skippedSubtasks } = splitParentOnly(
-      dedupeSubtasksOfSelectedParents(this._resolveInVisualOrder()),
+      dedupeSubtasksOfSelectedParents(resolved),
     );
     const tasks = dedupeByRepeatCfg(eligible.filter((t) => t.projectId !== projectId));
     if (!tasks.length) {
@@ -561,6 +570,33 @@ export class TaskBulkActionService {
       this._snack('ESTIMATE_SET', tasks.length, { estimate: msToString(ms) }, 'timer');
     } else {
       this._snack('ESTIMATE_CLEARED', tasks.length);
+    }
+    this._finish();
+  }
+
+  // ---- PRIORITY ---------------------------------------------------------
+
+  /** Sets one priority on every selected task, or clears it with `null`. */
+  async setPriority(priority: TaskPriority | null): Promise<void> {
+    const tasks = this._resolveInVisualOrder().filter(
+      (t) => getTaskPriority(t.priority) !== priority,
+    );
+    if (!tasks.length) {
+      this._snackNothingToDo();
+      return;
+    }
+    await this._runSuppressed(() =>
+      tasks.forEach((t) => this._taskService.update(t.id, { priority })),
+    );
+    if (priority) {
+      this._snack(
+        'PRIORITY_SET',
+        tasks.length,
+        { priority: this._translateService.instant(TASK_PRIORITY_LABEL_KEY[priority]) },
+        'priority_high',
+      );
+    } else {
+      this._snack('PRIORITY_CLEARED', tasks.length);
     }
     this._finish();
   }

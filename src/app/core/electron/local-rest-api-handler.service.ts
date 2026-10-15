@@ -1,20 +1,27 @@
 import { Injectable, inject } from '@angular/core';
 import { Store } from '@ngrx/store';
 import { firstValueFrom } from 'rxjs';
-import { nanoid } from 'nanoid';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { TaskService } from '../../features/tasks/task.service';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { Task, TaskWithSubTasks } from '../../features/tasks/task.model';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { TaskArchiveService } from '../../features/archive/task-archive.service';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { ProjectService } from '../../features/project/project.service';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { TagService } from '../../features/tag/tag.service';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { TODAY_TAG } from '../../features/tag/tag.const';
-import { NoteService } from '../../features/note/note.service';
-import { TaskRepeatCfgService } from '../../features/task-repeat-cfg/task-repeat-cfg.service';
-import { isTaskOverdue } from '../../features/tasks/util/is-task-overdue';
 import { DateService } from '../date/date.service';
+import { IssueLog } from '../log';
+import { LOCAL_REST_API_FEATURE_BRIDGE } from './local-rest-api-feature-bridge';
+import { LOCAL_REST_API_FEATURE_ROUTES } from './local-rest-api-feature-routes';
 
 import { TaskSharedActions } from '../../root-store/meta/task-shared.actions';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { getDeadlineAutoPlanFields } from '../../features/tasks/util/get-deadline-auto-plan-fields';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import {
   selectCurrentCycle,
   selectIsBreakTimeUp,
@@ -46,10 +53,6 @@ import {
   validateWritableProjectFields,
   pickAllowedTagFields,
   validateWritableTagFields,
-  pickAllowedNoteFields,
-  validateWritableNoteFields,
-  pickAllowedTaskRepeatCfgFields,
-  validateWritableTaskRepeatCfgFields,
   getQueryParam,
   getQueryParamAsBoolean,
   createErrorResponse,
@@ -57,8 +60,10 @@ import {
   TaskSource,
   isTaskInToday,
   parseAddTimeSpentBody,
+  readIsIgnoreShortSyntax,
+  isIncluded,
+  ISSUE_URL_TIMEOUT_MS,
 } from './local-rest-api-handler.utils';
-import { syncTimeSpent } from '../../features/time-tracking/store/time-tracking.actions';
 
 @Injectable({
   providedIn: 'root',
@@ -68,9 +73,10 @@ export class LocalRestApiHandlerService {
   private readonly _taskArchiveService = inject(TaskArchiveService);
   private readonly _projectService = inject(ProjectService);
   private readonly _tagService = inject(TagService);
-  private readonly _noteService = inject(NoteService);
-  private readonly _taskRepeatCfgService = inject(TaskRepeatCfgService);
   private readonly _dateService = inject(DateService);
+  private readonly _featureBridge = inject(LOCAL_REST_API_FEATURE_BRIDGE);
+  private readonly _featureRoutes =
+    inject(LOCAL_REST_API_FEATURE_ROUTES, { optional: true }) ?? [];
   private readonly _store = inject(Store);
   private _isInitialized = false;
 
@@ -164,7 +170,7 @@ export class LocalRestApiHandlerService {
     }
 
     if (segments[0] === 'tasks' && segments[1] && segments.length >= 2) {
-      return this._handleTaskRoutes(method, segments, requestId, body);
+      return this._handleTaskRoutes(method, segments, requestId, body, query);
     }
 
     if (method === 'GET' && path === '/projects') {
@@ -201,33 +207,10 @@ export class LocalRestApiHandlerService {
       }
     }
 
-    if (method === 'GET' && path === '/notes') {
-      return this._handleListNotes(requestId, query);
-    }
-
-    if (method === 'POST' && path === '/notes') {
-      return this._handleCreateNote(requestId, body);
-    }
-
-    if (segments[0] === 'notes' && segments[1] && segments.length === 2) {
-      if (method === 'PATCH') {
-        return this._handleUpdateNote(requestId, segments[1], body);
-      }
-      if (method === 'DELETE') {
-        return this._handleDeleteNote(requestId, segments[1]);
-      }
-    }
-
-    if (method === 'GET' && path === '/task-repeat-configs') {
-      return this._handleListTaskRepeatCfgs(requestId, query);
-    }
-
-    if (segments[0] === 'task-repeat-configs' && segments[1] && segments.length === 2) {
-      if (method === 'PATCH') {
-        return this._handleUpdateTaskRepeatCfg(requestId, segments[1], body);
-      }
-      if (method === 'DELETE') {
-        return this._handleDeleteTaskRepeatCfg(requestId, segments[1]);
+    for (const routes of this._featureRoutes) {
+      const response = await routes.handle(payload);
+      if (response) {
+        return response;
       }
     }
 
@@ -378,7 +361,9 @@ export class LocalRestApiHandlerService {
     if (overdue) {
       const todayStr = this._dateService.todayStr();
       const startOfNextDayDiffMs = this._dateService.getStartOfNextDayDiffMs();
-      filtered = filtered.filter((t) => isTaskOverdue(t, todayStr, startOfNextDayDiffMs));
+      filtered = filtered.filter((t) =>
+        this._featureBridge.isTaskOverdue(t, todayStr, startOfNextDayDiffMs),
+      );
     }
 
     if (!includeDone) {
@@ -409,6 +394,17 @@ export class LocalRestApiHandlerService {
         'subTaskIds cannot be set on task creation — create the parent first, then create each child with POST /tasks using parentId',
       );
     }
+
+    const shortSyntaxFlag = readIsIgnoreShortSyntax(body);
+    if (!shortSyntaxFlag.ok) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        shortSyntaxFlag.message,
+      );
+    }
+    const isIgnoreShortSyntax = shortSyntaxFlag.value;
 
     const title = body.title.trim();
     const additionalFields = pickAllowedFields(body);
@@ -492,10 +488,15 @@ export class LocalRestApiHandlerService {
         );
       }
 
-      const subTaskId = this._taskService.addSubTaskTo(body.parentId, {
-        title,
-        ...additionalFields,
-      });
+      const subTaskId = isIgnoreShortSyntax
+        ? this._featureBridge.addLiteralSubTask(body.parentId, {
+            title,
+            ...additionalFields,
+          })
+        : this._taskService.addSubTaskTo(body.parentId, {
+            title,
+            ...additionalFields,
+          });
       if (deadlineResolution.change?.type === 'set') {
         this._dispatchDeadlineChange(subTaskId, deadlineResolution.change);
       }
@@ -503,7 +504,9 @@ export class LocalRestApiHandlerService {
       return createSuccessResponse(requestId, 201, createdSubTask);
     }
 
-    const taskId = this._taskService.add(title, false, additionalFields);
+    const taskId = isIgnoreShortSyntax
+      ? this._taskService.add(title, false, additionalFields, false, true)
+      : this._taskService.add(title, false, additionalFields);
     if (deadlineResolution.change?.type === 'set') {
       this._dispatchDeadlineChange(taskId, deadlineResolution.change);
     }
@@ -517,6 +520,7 @@ export class LocalRestApiHandlerService {
     segments: string[],
     requestId: string,
     body: unknown,
+    query: Record<string, string | string[]>,
   ): Promise<LocalRestApiResponsePayload> {
     const taskId = segments[1];
 
@@ -526,7 +530,16 @@ export class LocalRestApiHandlerService {
         if (!task) {
           return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
         }
-        return createSuccessResponse(requestId, 200, task);
+        // Opt-in: some providers fetch the issue over the network to build
+        // the link, and most callers (e.g. frequent status polls) don't need it.
+        const issueUrl = isIncluded(query, 'issueUrl')
+          ? await this._getIssueUrl(task)
+          : undefined;
+        return createSuccessResponse(
+          requestId,
+          200,
+          issueUrl ? { ...task, issueUrl } : task,
+        );
       }
 
       if (method === 'PATCH') {
@@ -536,6 +549,16 @@ export class LocalRestApiHandlerService {
             400,
             'INVALID_INPUT',
             'PATCH body must be a JSON object',
+          );
+        }
+
+        const patchShortSyntaxFlag = readIsIgnoreShortSyntax(body);
+        if (!patchShortSyntaxFlag.ok) {
+          return createErrorResponse(
+            requestId,
+            400,
+            'INVALID_INPUT',
+            patchShortSyntaxFlag.message,
           );
         }
 
@@ -636,7 +659,21 @@ export class LocalRestApiHandlerService {
         }
 
         if (Object.keys(changes).length > 0) {
-          this._taskService.update(taskId, changes);
+          // Short syntax only parses a title-only change set, so that is the
+          // only shape the flag changes; everything else keeps going through
+          // update() and whatever bookkeeping it does.
+          const isTitleOnly =
+            Object.keys(changes).length === 1 && hasOwn(changes, 'title');
+          if (patchShortSyntaxFlag.value && isTitleOnly) {
+            this._store.dispatch(
+              TaskSharedActions.updateTask({
+                task: { id: taskId, changes },
+                isIgnoreShortSyntax: true,
+              }),
+            );
+          } else {
+            this._taskService.update(taskId, changes);
+          }
         }
         if (deadlineResolution.change) {
           this._dispatchDeadlineChange(taskId, deadlineResolution.change);
@@ -672,9 +709,7 @@ export class LocalRestApiHandlerService {
         return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
       if ('error' in parsed)
         return createErrorResponse(requestId, 400, 'INVALID_INPUT', parsed.error);
-      // Same pair as TaskService.addTimeSpentAndSync, but for any day.
-      this._taskService.addTimeSpent(task, parsed.duration, parsed.date);
-      this._store.dispatch(syncTimeSpent({ taskId, ...parsed }));
+      this._featureBridge.addTimeSpentOnDay(task, parsed.duration, parsed.date);
       return createSuccessResponse(requestId, 200, await this._getTaskById(taskId));
     }
 
@@ -1001,186 +1036,33 @@ export class LocalRestApiHandlerService {
     return createSuccessResponse(requestId, 200, { deleted: true, id: tagId });
   }
 
-  private async _handleListNotes(
-    requestId: string,
-    query: Record<string, string | string[]>,
-  ): Promise<LocalRestApiResponsePayload> {
-    const projectId = getQueryParam(query, 'projectId');
-    let notes = await firstValueFrom(this._noteService.notes$);
-
-    if (projectId) {
-      notes = notes.filter((n) => n.projectId === projectId);
+  /**
+   * Best-effort link to the task's issue for `GET /tasks/:id`. Returns
+   * undefined when the task has no issue, the provider can't build a link, or
+   * building it fails or times out — never turns the request into an error.
+   */
+  private async _getIssueUrl(task: Task): Promise<string | undefined> {
+    const { issueType, issueId, issueProviderId } = task;
+    if (!issueType || !issueId || !issueProviderId) {
+      return undefined;
     }
-
-    return createSuccessResponse(requestId, 200, notes);
-  }
-
-  private async _handleCreateNote(
-    requestId: string,
-    body: unknown,
-  ): Promise<LocalRestApiResponsePayload> {
-    if (!isRecord(body) || typeof body.content !== 'string' || !body.content.trim()) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'Note content must be a non-empty string',
-      );
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const url = await Promise.race([
+        this._featureBridge.issueLink(issueType, issueId, issueProviderId),
+        new Promise<undefined>((resolve) => {
+          timeoutId = setTimeout(() => resolve(undefined), ISSUE_URL_TIMEOUT_MS);
+        }),
+      ]);
+      return typeof url === 'string' && url ? url : undefined;
+    } catch {
+      IssueLog.warn('[LocalRestApi] issueUrl omitted: link lookup failed', {
+        id: task.id,
+      });
+      return undefined;
+    } finally {
+      clearTimeout(timeoutId);
     }
-
-    const additionalFields = pickAllowedNoteFields(body);
-    const validation = validateWritableNoteFields(additionalFields);
-    if (!validation.ok) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'One or more note fields have an invalid type',
-        validation.errors,
-      );
-    }
-
-    const id = nanoid();
-    this._noteService.add({ id, ...additionalFields, content: body.content });
-    const created = await firstValueFrom(this._noteService.getByIdOnce$(id));
-    return createSuccessResponse(requestId, 201, created);
-  }
-
-  private async _handleUpdateNote(
-    requestId: string,
-    noteId: string,
-    body: unknown,
-  ): Promise<LocalRestApiResponsePayload> {
-    if (!isRecord(body)) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'PATCH body must be a JSON object',
-      );
-    }
-
-    if ('content' in body && typeof body.content !== 'string') {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'content must be a string',
-      );
-    }
-
-    const changes = pickAllowedNoteFields(body);
-    const validation = validateWritableNoteFields(changes);
-    if (!validation.ok) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'One or more note fields have an invalid type',
-        validation.errors,
-      );
-    }
-
-    const note = await firstValueFrom(this._noteService.getByIdOnce$(noteId));
-    if (!note || note.id !== noteId) {
-      return createErrorResponse(requestId, 404, 'NOTE_NOT_FOUND', 'Note not found');
-    }
-
-    this._noteService.update(noteId, changes);
-    const updated = await firstValueFrom(this._noteService.getByIdOnce$(noteId));
-    return createSuccessResponse(requestId, 200, updated);
-  }
-
-  private async _handleDeleteNote(
-    requestId: string,
-    noteId: string,
-  ): Promise<LocalRestApiResponsePayload> {
-    const note = await firstValueFrom(this._noteService.getByIdOnce$(noteId));
-    if (!note || note.id !== noteId) {
-      return createErrorResponse(requestId, 404, 'NOTE_NOT_FOUND', 'Note not found');
-    }
-
-    this._noteService.remove(note);
-    return createSuccessResponse(requestId, 200, { deleted: true, id: noteId });
-  }
-
-  private async _handleListTaskRepeatCfgs(
-    requestId: string,
-    query: Record<string, string | string[]>,
-  ): Promise<LocalRestApiResponsePayload> {
-    const projectId = getQueryParam(query, 'projectId');
-    let cfgs = await firstValueFrom(this._taskRepeatCfgService.taskRepeatCfgs$);
-
-    if (projectId) {
-      cfgs = cfgs.filter((c) => c.projectId === projectId);
-    }
-
-    return createSuccessResponse(requestId, 200, cfgs);
-  }
-
-  private async _handleUpdateTaskRepeatCfg(
-    requestId: string,
-    cfgId: string,
-    body: unknown,
-  ): Promise<LocalRestApiResponsePayload> {
-    if (!isRecord(body)) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'PATCH body must be a JSON object',
-      );
-    }
-
-    const changes = pickAllowedTaskRepeatCfgFields(body);
-    const validation = validateWritableTaskRepeatCfgFields(changes);
-    if (!validation.ok) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'One or more task-repeat-cfg fields have an invalid type',
-        validation.errors,
-      );
-    }
-
-    const cfg = await firstValueFrom(
-      this._taskRepeatCfgService.getTaskRepeatCfgByIdAllowUndefined$(cfgId),
-    );
-    if (!cfg || cfg.id !== cfgId) {
-      return createErrorResponse(
-        requestId,
-        404,
-        'TASK_REPEAT_CFG_NOT_FOUND',
-        'Task-repeat-cfg not found',
-      );
-    }
-
-    this._taskRepeatCfgService.updateTaskRepeatCfg(cfgId, changes, false);
-    const updated = await firstValueFrom(
-      this._taskRepeatCfgService.getTaskRepeatCfgByIdAllowUndefined$(cfgId),
-    );
-    return createSuccessResponse(requestId, 200, updated);
-  }
-
-  private async _handleDeleteTaskRepeatCfg(
-    requestId: string,
-    cfgId: string,
-  ): Promise<LocalRestApiResponsePayload> {
-    const cfg = await firstValueFrom(
-      this._taskRepeatCfgService.getTaskRepeatCfgByIdAllowUndefined$(cfgId),
-    );
-    if (!cfg || cfg.id !== cfgId) {
-      return createErrorResponse(
-        requestId,
-        404,
-        'TASK_REPEAT_CFG_NOT_FOUND',
-        'Task-repeat-cfg not found',
-      );
-    }
-
-    this._taskRepeatCfgService.deleteTaskRepeatCfg(cfgId);
-    return createSuccessResponse(requestId, 200, { deleted: true, id: cfgId });
   }
 
   // The id equality checks reject prototype-property names ('constructor',

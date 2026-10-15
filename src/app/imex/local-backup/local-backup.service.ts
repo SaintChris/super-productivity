@@ -7,7 +7,7 @@ import { catchError, debounceTime, exhaustMap, map, switchMap } from 'rxjs/opera
 import { LOCAL_ACTIONS } from '../../util/local-actions.token';
 import { LocalBackupMeta } from './local-backup.model';
 import { IS_ANDROID_WEB_VIEW_TOKEN } from '../../util/is-android-web-view';
-import { IS_ELECTRON } from '../../app.constants';
+import { IS_ELECTRON, IS_ELECTRON_TOKEN } from '../../app.constants';
 import { androidInterface } from '../../features/android/android-interface';
 import { StateSnapshotService } from '../../op-log/backup/state-snapshot.service';
 import { BackupService } from '../../op-log/backup/backup.service';
@@ -26,6 +26,7 @@ import {
 } from './backup-ring.util';
 import { DEFAULT_MAX_BACKUP_FILES } from '../../../../electron/shared-with-frontend/backup-file-cleanup.util';
 import { SnackService } from '../../core/snack/snack.service';
+import { BackupRepairFailedError } from '../../op-log/core/errors/sync-errors';
 import { Log } from '../../core/log';
 import { confirmDialog } from '../../util/native-dialogs';
 import { CapacitorPlatformService } from '../../core/platform/capacitor-platform.service';
@@ -66,6 +67,7 @@ export class LocalBackupService {
   private _platformService = inject(CapacitorPlatformService);
   private _localActions$ = inject(LOCAL_ACTIONS);
   private _isAndroidWebView = inject(IS_ANDROID_WEB_VIEW_TOKEN);
+  private _isElectron = inject(IS_ELECTRON_TOKEN);
 
   private _cfg$: Observable<LocalBackupConfig> = this._configService.cfg$.pipe(
     map((cfg) => cfg.localBackup),
@@ -416,9 +418,10 @@ export class LocalBackupService {
     }
 
     let didWrite = false;
-    if (IS_ELECTRON) {
+    if (this._isElectron) {
       // Electron has its own rotated, timestamped chain — no ring or A3 guard
-      // needed (the bug class A3 protects against doesn't apply).
+      // needed (the bug class A3 protects against doesn't apply). A failed write
+      // rejects (#10022), skipping the timestamp; the trigger's catchError logs it.
       await this._backupElectron(data);
       didWrite = true;
     }
@@ -633,6 +636,13 @@ export class LocalBackupService {
         false,
         true,
         true,
+        false, // isSkipPreImportBackup
+        undefined, // requiredImportBackupId
+        // Every caller restores this device's own auto-backup (Electron backup
+        // dir, mobile ring slots): state that was already live here. Refusing
+        // it for errors repair cannot fix would leave the user no way back
+        // after local data loss (#8279). Picked files use FileImexComponent.
+        true, // isOwnStateRestore
       );
       // This profile's notes were just replaced wholesale (Electron startup
       // restore, mobile auto-restore, Android Settings restore all funnel
@@ -643,7 +653,10 @@ export class LocalBackupService {
     } catch (e) {
       this._snackService.open({
         type: 'ERROR',
-        msg: T.FILE_IMEX.S_ERR_IMPORT_FAILED,
+        msg:
+          e instanceof BackupRepairFailedError
+            ? T.FILE_IMEX.S_ERR_IMPORT_UNREPAIRABLE
+            : T.FILE_IMEX.S_ERR_IMPORT_FAILED,
       });
       return false;
     }

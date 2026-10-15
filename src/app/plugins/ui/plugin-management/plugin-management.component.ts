@@ -32,11 +32,15 @@ import { PluginIconComponent } from '../plugin-icon/plugin-icon.component';
 import { PluginConfigDialogComponent } from '../plugin-config-dialog/plugin-config-dialog.component';
 import { IS_ELECTRON } from '../../../app.constants';
 import { PluginLog } from '../../../core/log';
+import { SnackService } from '../../../core/snack/snack.service';
 import { PluginBridgeService } from '../../plugin-bridge.service';
 import { CollapsibleComponent } from '../../../ui/collapsible/collapsible.component';
 import { LanguageCode } from '../../../core/locale.constants';
 import { GlobalConfigService } from '../../../features/config/global-config.service';
-import { confirmDialog } from '../../../util/native-dialogs';
+import { escapeHtml } from '../../../util/escape-html';
+import { getUploadedPluginIds } from '../../plugin-state.model';
+import { DialogConfirmComponent } from '../../../ui/dialog-confirm/dialog-confirm.component';
+import { firstValueFrom } from 'rxjs';
 import { Store } from '@ngrx/store';
 import { Router } from '@angular/router';
 import { selectAll as selectAllIssueProviders } from '../../../features/issue/store/issue-provider.selectors';
@@ -93,6 +97,7 @@ export class PluginManagementComponent {
   private readonly _router = inject(Router);
   private readonly _layoutService = inject(LayoutService);
   private readonly _pluginBridge = inject(PluginBridgeService);
+  private readonly _snackService = inject(SnackService);
   private readonly _allIssueProviders = this._store.selectSignal(selectAllIssueProviders);
 
   // Language code to human-readable name mapping
@@ -220,14 +225,12 @@ export class PluginManagementComponent {
     );
     if (attachedProviders.length > 0) {
       if (
-        !confirmDialog(
-          this._translateService.instant(T.PLUGINS.CONFIRM_DISABLE_WITH_ISSUE_PROVIDERS, {
-            count: attachedProviders.length,
-            name: plugin.manifest.name,
-          }),
-        )
+        !(await this._confirmInDialog(T.PLUGINS.CONFIRM_DISABLE_WITH_ISSUE_PROVIDERS, {
+          count: attachedProviders.length,
+          name: escapeHtml(plugin.manifest.name),
+        }))
       ) {
-        // Reset toggle back to enabled since user cancelled
+        // The toggle switched itself off on click; turn it back on since the user cancelled
         event.source.checked = true;
         return;
       }
@@ -300,7 +303,16 @@ export class PluginManagementComponent {
     this.uploadError.set(null);
 
     try {
-      await this._pluginService.loadPluginFromZip(file);
+      const plugin = await this._pluginService.loadPluginFromZip(file);
+      // A plugin whose code fails at load time still resolves, with `error`
+      // set and its card showing the failure; only a clean load gets a snack.
+      if (!plugin.error) {
+        this._snackService.open({
+          type: 'SUCCESS',
+          msg: T.PLUGINS.PLUGIN_INSTALLED,
+          translateParams: { name: plugin.manifest.name },
+        });
+      }
 
       // Clear the input
       input.value = '';
@@ -317,6 +329,20 @@ export class PluginManagementComponent {
   }
 
   async clearPluginCache(): Promise<void> {
+    // Counts the same plugins clearUploadedPluginsFromMemory removes. With none
+    // installed, nothing visible is lost, so the cache is cleared without asking.
+    const uploadedCount = getUploadedPluginIds(this._pluginService.pluginStates()).length;
+    if (
+      uploadedCount > 0 &&
+      !(await this._confirmInDialog(
+        T.PLUGINS.CONFIRM_CLEAR_CACHE,
+        { count: uploadedCount },
+        T.PLUGINS.CLEAR_PLUGIN_CACHE,
+      ))
+    ) {
+      return;
+    }
+
     try {
       this.isUploading.set(true);
       this.uploadError.set(null);
@@ -349,12 +375,13 @@ export class PluginManagementComponent {
   }
 
   async removeUploadedPlugin(plugin: PluginInstance): Promise<void> {
+    // The name comes from the uploaded ZIP and the dialog renders the message as HTML.
     if (
-      !confirmDialog(
-        this._translateService.instant(T.PLUGINS.CONFIRM_REMOVE, {
-          name: plugin.manifest.name,
-        }),
-      )
+      !(await this._confirmInDialog(
+        T.PLUGINS.CONFIRM_REMOVE,
+        { name: escapeHtml(plugin.manifest.name) },
+        T.PLUGINS.REMOVE,
+      ))
     ) {
       return;
     }
@@ -376,6 +403,23 @@ export class PluginManagementComponent {
     } finally {
       this.isUploading.set(false);
     }
+  }
+
+  /** Resolves true only for the OK button; Cancel, Esc and backdrop resolve false. */
+  private async _confirmInDialog(
+    message: string,
+    translateParams: Record<string, string | number>,
+    okTxt?: string,
+  ): Promise<boolean> {
+    const result = await firstValueFrom(
+      this._dialog
+        .open(DialogConfirmComponent, {
+          restoreFocus: true,
+          data: { message, translateParams, okTxt },
+        })
+        .afterClosed(),
+    );
+    return result === true;
   }
 
   getPluginDescription(plugin: PluginInstance): string {
@@ -504,12 +548,10 @@ export class PluginManagementComponent {
       }
     } catch (error) {
       PluginLog.err('Failed to open config dialog:', error);
-      // Show error to user
-      this.uploadError.set(
-        error instanceof Error
-          ? error.message
-          : this._translateService.instant(T.PLUGINS.FAILED_TO_LOAD_CONFIG),
-      );
+      // A snack, not `uploadError`: that one renders in the "Install Plugin" card,
+      // far from the plugin whose settings button was clicked. The thrown messages
+      // are untranslated developer text, so they stay in the log above.
+      this._snackService.open({ type: 'ERROR', msg: T.PLUGINS.FAILED_TO_LOAD_CONFIG });
     }
   }
 

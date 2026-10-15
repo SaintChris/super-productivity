@@ -1,7 +1,6 @@
 import typia from 'typia';
 import { isTodayWithOffset } from '../../util/is-today.util';
 import { isValidDBDateStr } from '../../util/get-db-date-str';
-import { LocalRestApiResponsePayload } from '../../../../electron/shared-with-frontend/local-rest-api.model';
 
 /**
  * Structural stand-ins for `Task` fields this file touches. Kept local
@@ -305,37 +304,41 @@ export const getQueryParamAsBoolean = (
   return value.toLowerCase() === 'true';
 };
 
-export const createErrorResponse = (
-  requestId: string,
-  status: number,
-  code: string,
-  message: string,
-  details?: unknown,
-): LocalRestApiResponsePayload => ({
-  requestId,
-  status,
-  body: {
-    ok: false,
-    error: {
-      code,
-      message,
-      details,
-    },
-  },
-});
+export { createErrorResponse, createSuccessResponse } from './local-rest-api-response';
 
-export const createSuccessResponse = (
-  requestId: string,
-  status: number,
-  data: unknown,
-): LocalRestApiResponsePayload => ({
-  requestId,
-  status,
-  body: {
-    ok: true,
-    data,
-  },
-});
+/**
+ * `isIgnoreShortSyntax: true` in a POST/PATCH body stores the title literally:
+ * `#tag`, `+project`, `30m`, `@date` and URLs are not parsed out of it. Opt-in
+ * so scripts that rely on parsing keep working; returns an error message for a
+ * non-boolean value.
+ */
+export const readIsIgnoreShortSyntax = (
+  body: Record<string, unknown>,
+): { ok: true; value: boolean } | { ok: false; message: string } => {
+  const value = body['isIgnoreShortSyntax'];
+  if (value === undefined) return { ok: true, value: false };
+  return typeof value === 'boolean'
+    ? { ok: true, value }
+    : { ok: false, message: 'isIgnoreShortSyntax must be a boolean' };
+};
+
+/** `?include=a,b` (or repeated `include=`) asks for optional response fields. */
+export const isIncluded = (
+  query: Record<string, string | string[]>,
+  field: string,
+): boolean => {
+  const value = query['include'];
+  const values = value === undefined ? [] : Array.isArray(value) ? value : [value];
+  return values.some((v) => v.split(',').some((part) => part.trim() === field));
+};
+
+/**
+ * Upper bound for building `issueUrl` on `GET /tasks/:id?include=issueUrl`. Some providers
+ * (e.g. plugin providers without a derivable link) fetch the issue over the
+ * network; the link is a convenience, so a slow or offline provider must not
+ * eat the renderer's whole request budget (`LOCAL_REST_API_TIMEOUT_MS`).
+ */
+export const ISSUE_URL_TIMEOUT_MS = 3000;
 
 export type TaskSource = 'active' | 'archived' | 'all';
 
