@@ -43,6 +43,9 @@ let isEnabled = false;
 // token cannot be stored, and the saved setting stays `true` regardless. Kept
 // apart so a later recovery can tell "the user wants this on" from "it is on".
 let isEnabledDesired = false;
+// Set when a persisted token file auto-enabled the API at startup, so the
+// renderer's saved setting cannot switch it off again.
+let isEnabledByTokenFile = false;
 let isListening = false;
 const pendingRequests = new Map<
   string,
@@ -459,8 +462,7 @@ const ALLOWED_HOSTS = new Set([
   'localhost',
 ]);
 
-const isForceEnabledForDev = (): boolean =>
-  process.env.NODE_ENV === 'DEV' && process.env.SP_FORCE_LOCAL_REST_API === '1';
+const isForceEnabledForDev = (): boolean => process.env.SP_FORCE_LOCAL_REST_API === '1';
 
 const getForcedDevToken = (): string => {
   if (process.env.SP_FORCE_LOCAL_REST_API_TOKEN) {
@@ -682,6 +684,16 @@ export const initLocalRestApi = (): void => {
     localRestApiToken = getForcedDevToken();
     isEnabled = true;
     startServer();
+  } else {
+    const persistedToken = loadPersistedToken();
+    if (persistedToken) {
+      log('[local-rest-api] Token file found on disk — auto-enabling API');
+      localRestApiToken = persistedToken;
+      isEnabled = true;
+      isEnabledDesired = true;
+      isEnabledByTokenFile = true;
+      startServer();
+    }
   }
 };
 
@@ -741,7 +753,8 @@ const stopServer = (): void => {
 
 export const updateLocalRestApiConfig = (cfg: GlobalConfigState): void => {
   const isForcedForDev = isForceEnabledForDev();
-  const nextEnabled = isForcedForDev || !!cfg.misc.isLocalRestApiEnabled;
+  const nextEnabled =
+    isForcedForDev || isEnabledByTokenFile || !!cfg.misc.isLocalRestApiEnabled;
   isEnabledDesired = nextEnabled;
   // Ensure a token exists whenever the server is (about to be) serving, so
   // enabling the API never starts an unreachable server with no credential.
