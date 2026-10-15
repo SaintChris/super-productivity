@@ -198,6 +198,7 @@ const callTool = async (name, rawArgs) => {
           method: 'POST',
           body: JSON.stringify({
             title: args.title,
+            isIgnoreShortSyntax: true,
             projectId: args.project_id,
             ...(args.notes !== undefined ? { notes: args.notes } : {}),
             ...(args.due_day !== undefined ? { dueDay: args.due_day } : {}),
@@ -213,7 +214,10 @@ const callTool = async (name, rawArgs) => {
       case 'update_task': {
         const current = await api(`/tasks/${encodeURIComponent(args.task_id)}`);
         const changes = {};
-        if (args.title !== undefined) changes.title = args.title;
+        if (args.title !== undefined) {
+          changes.title = args.title;
+          changes.isIgnoreShortSyntax = true;
+        }
         if (args.notes !== undefined) changes.notes = args.notes;
         if (args.due_day !== undefined) changes.dueDay = args.due_day;
         if (args.project_id !== undefined) changes.projectId = args.project_id;
@@ -228,7 +232,7 @@ const callTool = async (name, rawArgs) => {
         return ok({
           task: await api(`/tasks/${encodeURIComponent(args.task_id)}`),
           task_id: args.task_id,
-          changed_fields: Object.keys(changes),
+          changed_fields: Object.keys(changes).filter((k) => k !== 'isIgnoreShortSyntax'),
         });
       }
       case 'complete_task': {

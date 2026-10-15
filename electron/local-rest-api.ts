@@ -43,9 +43,14 @@ let isEnabled = false;
 // token cannot be stored, and the saved setting stays `true` regardless. Kept
 // apart so a later recovery can tell "the user wants this on" from "it is on".
 let isEnabledDesired = false;
-// Set when a persisted token file auto-enabled the API at startup, so the
-// renderer's saved setting cannot switch it off again.
+// Set when a persisted token file auto-enabled the API at startup, so a saved
+// setting of `false` does not switch it off again on launch. Only an explicit
+// turn-off (the setting going from true to false) clears it.
 let isEnabledByTokenFile = false;
+// The last `isLocalRestApiEnabled` the renderer sent, or undefined before the
+// first config arrives. It is what tells "the user just switched it off" apart
+// from "the saved setting has always been off".
+let lastCfgEnabled: boolean | undefined = undefined;
 let isListening = false;
 const pendingRequests = new Map<
   string,
@@ -271,6 +276,29 @@ const persistToken = (token: string): void => {
       // Best effort: there may be nothing to clean up.
     }
     throw error;
+  }
+};
+
+/**
+ * Deletes the persisted token file. A present file auto-enables the API on the
+ * next launch, so an explicit turn-off has to remove it or the setting would
+ * not survive a restart. Never throws: turning the API off must not fail. A
+ * file that cannot be removed is logged, because the API will come back up on
+ * the next launch.
+ */
+const removePersistedToken = (): void => {
+  try {
+    unlinkSync(getTokenFilePath());
+    log('[local-rest-api] Removed the access token file — API stays off on next launch');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return;
+    }
+    warn(
+      '[local-rest-api] Could not remove the access token file — the API will ' +
+        'auto-enable again on next launch',
+      error,
+    );
   }
 };
 
@@ -754,8 +782,29 @@ const stopServer = (): void => {
 
 export const updateLocalRestApiConfig = (cfg: GlobalConfigState): void => {
   const isForcedForDev = isForceEnabledForDev();
-  const nextEnabled =
-    isForcedForDev || isEnabledByTokenFile || !!cfg.misc.isLocalRestApiEnabled;
+  const cfgEnabled = !!cfg.misc.isLocalRestApiEnabled;
+  const prevCfgEnabled = lastCfgEnabled;
+  lastCfgEnabled = cfgEnabled;
+
+  // Transition rule for the token-file auto-enable: only the setting going
+  // from true to false is a turn-off. The first config after launch carries
+  // whatever was saved, and a saved `false` must not stop an API the token
+  // file started — agents rely on it being up at launch. A real turn-off
+  // removes the file, so the next launch stays off until the user turns the
+  // setting on again, which mints a fresh token via ensureToken().
+  // Forced-dev mode never uses the file, so it is left alone there.
+  if (prevCfgEnabled === true && !cfgEnabled && !isForcedForDev) {
+    isEnabledByTokenFile = false;
+    localRestApiToken = undefined;
+    removePersistedToken();
+  } else if (prevCfgEnabled === undefined && !cfgEnabled && isEnabledByTokenFile) {
+    log(
+      '[local-rest-api] Setting is off but a token file is present — keeping the API ' +
+        'on. Turn the setting on and off again to disable it.',
+    );
+  }
+
+  const nextEnabled = isForcedForDev || isEnabledByTokenFile || cfgEnabled;
   isEnabledDesired = nextEnabled;
   // Ensure a token exists whenever the server is (about to be) serving, so
   // enabling the API never starts an unreachable server with no credential.

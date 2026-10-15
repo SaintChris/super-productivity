@@ -917,7 +917,9 @@ describe('LocalRestApiHandlerService', () => {
         });
 
         const response = await sendRequestAndWait(
-          createRequest('POST', '/tasks', { body: { title: 'New Task' } }),
+          createRequest('POST', '/tasks', {
+            body: { title: 'New Task', isIgnoreShortSyntax: false },
+          }),
         );
 
         expect(response.body.ok).toBe(true);
@@ -944,6 +946,7 @@ describe('LocalRestApiHandlerService', () => {
               title: 'Deadline task',
               notes: 'created through REST',
               deadlineDay: '2026-05-12',
+              isIgnoreShortSyntax: false,
             },
           }),
         );
@@ -1040,6 +1043,7 @@ describe('LocalRestApiHandlerService', () => {
               title: 'New Task',
               notes: 'allowed',
               id: 'injected-id',
+              isIgnoreShortSyntax: false,
             },
           }),
         );
@@ -1177,9 +1181,51 @@ describe('LocalRestApiHandlerService', () => {
           expect(dispatchSpy).not.toHaveBeenCalled();
         });
 
-        it('should keep parsing by default', async () => {
+        it('should store a POST title literally by default', async () => {
+          await sendRequestAndWait(
+            createRequest('POST', '/tasks', { body: { title: 'Fix PR #4' } }),
+          );
+
+          expect(taskServiceMock.add).toHaveBeenCalledWith(
+            'Fix PR #4',
+            false,
+            { title: 'Fix PR #4' },
+            false,
+            true,
+          );
+        });
+
+        it('should parse a POST title when isIgnoreShortSyntax is false', async () => {
+          await sendRequestAndWait(
+            createRequest('POST', '/tasks', {
+              body: { title: 'Fix PR #4', isIgnoreShortSyntax: false },
+            }),
+          );
+
+          expect(taskServiceMock.add).toHaveBeenCalledWith('Fix PR #4', false, {
+            title: 'Fix PR #4',
+          });
+        });
+
+        it('should update a PATCH title literally by default', async () => {
           await sendRequestAndWait(
             createRequest('PATCH', '/tasks/task-1', { body: { title: 'Renamed #tag' } }),
+          );
+
+          expect(taskServiceMock.update).not.toHaveBeenCalled();
+          expect(dispatchSpy).toHaveBeenCalledOnceWith(
+            TaskSharedActions.updateTask({
+              task: { id: 'task-1', changes: { title: 'Renamed #tag' } },
+              isIgnoreShortSyntax: true,
+            }),
+          );
+        });
+
+        it('should parse a PATCH title when isIgnoreShortSyntax is false', async () => {
+          await sendRequestAndWait(
+            createRequest('PATCH', '/tasks/task-1', {
+              body: { title: 'Renamed #tag', isIgnoreShortSyntax: false },
+            }),
           );
 
           expect(taskServiceMock.update).toHaveBeenCalledWith('task-1', {
@@ -1202,7 +1248,12 @@ describe('LocalRestApiHandlerService', () => {
 
           const response = await sendRequestAndWait(
             createRequest('POST', '/tasks', {
-              body: { title: 'Child', parentId: 'parent-1', notes: 'child notes' },
+              body: {
+                title: 'Child',
+                parentId: 'parent-1',
+                notes: 'child notes',
+                isIgnoreShortSyntax: false,
+              },
             }),
           );
 
@@ -1233,6 +1284,7 @@ describe('LocalRestApiHandlerService', () => {
                 title: 'Child with deadline',
                 parentId: 'parent-1',
                 deadlineWithTime: 1_778_582_400_000,
+                isIgnoreShortSyntax: false,
               },
             }),
           );
@@ -1535,7 +1587,9 @@ describe('LocalRestApiHandlerService', () => {
         });
 
         const response = await sendRequestAndWait(
-          createRequest('PATCH', '/tasks/task-1', { body: { title: 'Updated Title' } }),
+          createRequest('PATCH', '/tasks/task-1', {
+            body: { title: 'Updated Title', isIgnoreShortSyntax: false },
+          }),
         );
 
         expect(response.body.ok).toBe(true);
@@ -1937,7 +1991,11 @@ describe('LocalRestApiHandlerService', () => {
 
         await sendRequestAndWait(
           createRequest('PATCH', '/tasks/task-1', {
-            body: { title: 'Updated title', deadlineDay: '2026-05-13' },
+            body: {
+              title: 'Updated title',
+              deadlineDay: '2026-05-13',
+              isIgnoreShortSyntax: false,
+            },
           }),
         );
 
@@ -2022,7 +2080,7 @@ describe('LocalRestApiHandlerService', () => {
 
         await sendRequestAndWait(
           createRequest('PATCH', '/tasks/task-1', {
-            body: { title: 'Updated', id: 'injected-id' },
+            body: { title: 'Updated', id: 'injected-id', isIgnoreShortSyntax: false },
           }),
         );
 

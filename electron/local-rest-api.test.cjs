@@ -1131,6 +1131,95 @@ test('recovering a token does not start a server the user disabled', async () =>
   }
 });
 
+// A token file on disk starts the API at launch even though the saved setting
+// may be off — agents depend on that. The saved `false` the renderer sends
+// first must not undo it; only the user switching the setting from on to off
+// may, and that has to delete the file so the next launch stays off.
+test('a token file auto-enables at launch until the setting is switched off', async () => {
+  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sp-lra-tokenfile-'));
+  const tokenPath = path.join(profileDir, 'local-rest-api-token');
+  const existingToken = 'c'.repeat(32);
+  fs.writeFileSync(tokenPath, existingToken, { mode: 0o600 });
+  const port = takeIsolatedPort();
+  const ctx = createContext({ port, userDataDir: profileDir });
+  const isolated = loadModule(ctx);
+  const authedTasks = (token, onPort = port) =>
+    makeRequest(
+      { method: 'GET', path: '/tasks', headers: { Authorization: `Bearer ${token}` } },
+      undefined,
+      onPort,
+    );
+  let nextLaunch;
+
+  try {
+    // Launch: the token file alone brings the API up.
+    isolated.initLocalRestApi();
+    await settleListen();
+    assert.equal((await authedTasks(existingToken)).status, 200);
+
+    // The first config carries the saved `false`: not a turn-off.
+    isolated.updateLocalRestApiConfig({ misc: { isLocalRestApiEnabled: false } });
+    await settleListen();
+    assert.equal(
+      (await authedTasks(existingToken)).status,
+      200,
+      'the saved setting switched off an API the token file started',
+    );
+    assert.equal(fs.readFileSync(tokenPath, 'utf8').trim(), existingToken);
+
+    // The user switches it on, then off: that is a turn-off.
+    isolated.updateLocalRestApiConfig({ misc: { isLocalRestApiEnabled: true } });
+    await settleListen();
+    assert.equal((await authedTasks(existingToken)).status, 200);
+    isolated.updateLocalRestApiConfig({ misc: { isLocalRestApiEnabled: false } });
+    await settleListen();
+    // A keep-alive socket from the requests above may be reused and then
+    // dropped by closeAllConnections(), which surfaces as a hang-up rather
+    // than a refusal. Either way nothing is served.
+    await assert.rejects(
+      () => makeRequest({ method: 'GET', path: '/health' }, undefined, port),
+      /ECONNREFUSED|ECONNRESET|socket hang up/,
+      'the API kept serving after the user switched it off',
+    );
+    assert.equal(
+      fs.existsSync(tokenPath),
+      false,
+      'the token file survived a turn-off, so the next launch would re-enable the API',
+    );
+
+    // Next launch against the same profile: no file, saved setting off, so
+    // nothing listens.
+    const nextPort = takeIsolatedPort();
+    nextLaunch = loadModule(createContext({ port: nextPort, userDataDir: profileDir }));
+    nextLaunch.initLocalRestApi();
+    nextLaunch.updateLocalRestApiConfig({ misc: { isLocalRestApiEnabled: false } });
+    await settleListen();
+    await assert.rejects(
+      () => makeRequest({ method: 'GET', path: '/health' }, undefined, nextPort),
+      /ECONNREFUSED/,
+      'the API came back on the launch after a turn-off',
+    );
+
+    // Switching it on again recreates the file and serves the new token; the
+    // old one stays revoked.
+    isolated.updateLocalRestApiConfig({ misc: { isLocalRestApiEnabled: true } });
+    await settleListen();
+    assert.ok(fs.existsSync(tokenPath), 'turning the API back on stored no token');
+    const recreated = fs.readFileSync(tokenPath, 'utf8').trim();
+    assert.match(recreated, /^[A-Za-z0-9]{32}$/);
+    assert.equal(ctx.handleHandlers.get('LOCAL_REST_API_GET_TOKEN')(), recreated);
+    assert.equal((await authedTasks(recreated)).status, 200);
+    assert.equal((await authedTasks(existingToken)).status, 401);
+  } finally {
+    await settleListen();
+    isolated.updateLocalRestApiConfig({ misc: { isLocalRestApiEnabled: false } });
+    if (nextLaunch) {
+      nextLaunch.updateLocalRestApiConfig({ misc: { isLocalRestApiEnabled: false } });
+    }
+    fs.rmSync(profileDir, { recursive: true, force: true });
+  }
+});
+
 test('SP_FORCE_LOCAL_REST_API can use an explicit dev token', async () => {
   const originalNodeEnv = process.env.NODE_ENV;
   const originalForce = process.env.SP_FORCE_LOCAL_REST_API;

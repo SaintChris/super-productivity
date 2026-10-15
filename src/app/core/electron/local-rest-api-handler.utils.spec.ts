@@ -1,4 +1,7 @@
-import { parseAddTimeSpentBody } from './local-rest-api-handler.utils';
+import {
+  parseAddTimeSpentBody,
+  readIsIgnoreShortSyntax,
+} from './local-rest-api-handler.utils';
 
 describe('parseAddTimeSpentBody', () => {
   it('accepts a valid date and positive integer duration', () => {
@@ -28,5 +31,31 @@ describe('parseAddTimeSpentBody', () => {
   it('rejects non-object bodies', () => {
     expect('error' in parseAddTimeSpentBody(null)).toBe(true);
     expect('error' in parseAddTimeSpentBody([])).toBe(true);
+  });
+});
+
+describe('readIsIgnoreShortSyntax', () => {
+  it('defaults to literal titles when absent', () => {
+    expect(readIsIgnoreShortSyntax({})).toEqual({ ok: true, value: true });
+  });
+
+  it('returns true when true', () => {
+    expect(readIsIgnoreShortSyntax({ isIgnoreShortSyntax: true })).toEqual({
+      ok: true,
+      value: true,
+    });
+  });
+
+  it('returns false when explicitly false', () => {
+    expect(readIsIgnoreShortSyntax({ isIgnoreShortSyntax: false })).toEqual({
+      ok: true,
+      value: false,
+    });
+  });
+
+  it('rejects non-boolean values', () => {
+    for (const v of ['yes', 1, null]) {
+      expect(readIsIgnoreShortSyntax({ isIgnoreShortSyntax: v }).ok).toBe(false);
+    }
   });
 });

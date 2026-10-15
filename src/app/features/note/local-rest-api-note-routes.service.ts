@@ -16,6 +16,7 @@ import {
   pickAllowedNoteFields,
   validateWritableNoteFields,
 } from '../../core/electron/local-rest-api-handler.utils';
+import { Note } from './note.model';
 import { NoteService } from './note.service';
 
 /** Local REST API routes under `/notes`. */
@@ -43,6 +44,9 @@ export class LocalRestApiNoteRoutesService implements LocalRestApiFeatureRoutes 
     }
 
     if (segments.length === 2) {
+      if (method === 'GET') {
+        return this._handleGetNote(requestId, segments[1]);
+      }
       if (method === 'PATCH') {
         return this._handleUpdateNote(requestId, segments[1], body);
       }
@@ -52,6 +56,11 @@ export class LocalRestApiNoteRoutesService implements LocalRestApiFeatureRoutes 
     }
 
     return undefined;
+  }
+
+  private async _findNote(id: string): Promise<Note | undefined> {
+    const notes = await firstValueFrom(this._noteService.notes$);
+    return notes.find((n) => n.id === id);
   }
 
   private async _handleListNotes(
@@ -66,6 +75,17 @@ export class LocalRestApiNoteRoutesService implements LocalRestApiFeatureRoutes 
     }
 
     return createSuccessResponse(requestId, 200, notes);
+  }
+
+  private async _handleGetNote(
+    requestId: string,
+    noteId: string,
+  ): Promise<LocalRestApiResponsePayload> {
+    const note = await this._findNote(noteId);
+    if (!note || note.id !== noteId) {
+      return createErrorResponse(requestId, 404, 'NOTE_NOT_FOUND', 'Note not found');
+    }
+    return createSuccessResponse(requestId, 200, note);
   }
 
   private async _handleCreateNote(
@@ -95,7 +115,7 @@ export class LocalRestApiNoteRoutesService implements LocalRestApiFeatureRoutes 
 
     const id = nanoid();
     this._noteService.add({ id, ...additionalFields, content: body.content });
-    const created = await firstValueFrom(this._noteService.getByIdOnce$(id));
+    const created = await this._findNote(id);
     return createSuccessResponse(requestId, 201, created);
   }
 
@@ -134,13 +154,13 @@ export class LocalRestApiNoteRoutesService implements LocalRestApiFeatureRoutes 
       );
     }
 
-    const note = await firstValueFrom(this._noteService.getByIdOnce$(noteId));
+    const note = await this._findNote(noteId);
     if (!note || note.id !== noteId) {
       return createErrorResponse(requestId, 404, 'NOTE_NOT_FOUND', 'Note not found');
     }
 
     this._noteService.update(noteId, changes);
-    const updated = await firstValueFrom(this._noteService.getByIdOnce$(noteId));
+    const updated = await this._findNote(noteId);
     return createSuccessResponse(requestId, 200, updated);
   }
 
@@ -148,7 +168,7 @@ export class LocalRestApiNoteRoutesService implements LocalRestApiFeatureRoutes 
     requestId: string,
     noteId: string,
   ): Promise<LocalRestApiResponsePayload> {
-    const note = await firstValueFrom(this._noteService.getByIdOnce$(noteId));
+    const note = await this._findNote(noteId);
     if (!note || note.id !== noteId) {
       return createErrorResponse(requestId, 404, 'NOTE_NOT_FOUND', 'Note not found');
     }

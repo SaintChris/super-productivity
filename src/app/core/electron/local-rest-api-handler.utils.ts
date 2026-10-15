@@ -307,16 +307,16 @@ export const getQueryParamAsBoolean = (
 export { createErrorResponse, createSuccessResponse } from './local-rest-api-response';
 
 /**
- * `isIgnoreShortSyntax: true` in a POST/PATCH body stores the title literally:
- * `#tag`, `+project`, `30m`, `@date` and URLs are not parsed out of it. Opt-in
- * so scripts that rely on parsing keep working; returns an error message for a
- * non-boolean value.
+ * Titles in POST/PATCH bodies are stored literally by default in this fork:
+ * `#tag`, `+project`, `30m`, `@date` and URLs are not parsed out of them.
+ * `isIgnoreShortSyntax: false` opts into short-syntax parsing. Returns an
+ * error message for a non-boolean value.
  */
 export const readIsIgnoreShortSyntax = (
   body: Record<string, unknown>,
 ): { ok: true; value: boolean } | { ok: false; message: string } => {
   const value = body['isIgnoreShortSyntax'];
-  if (value === undefined) return { ok: true, value: false };
+  if (value === undefined) return { ok: true, value: true };
   return typeof value === 'boolean'
     ? { ok: true, value }
     : { ok: false, message: 'isIgnoreShortSyntax must be a boolean' };
