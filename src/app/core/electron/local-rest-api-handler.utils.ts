@@ -133,72 +133,6 @@ export const validateWritableFields = (
 export const firstRejectedField = (body: Record<string, unknown>): string | undefined =>
   REJECTED_TASK_FIELDS.find((field) => field in body);
 
-/** Only these fields may be set on a project via the REST API — see ALLOWED_TASK_FIELDS. */
-export const ALLOWED_PROJECT_FIELDS = new Set<string>(['title', 'icon']);
-
-export interface WritableProjectFields {
-  title?: string;
-  icon?: string | null;
-}
-
-export const pickAllowedProjectFields = (
-  body: Record<string, unknown>,
-): Partial<WritableProjectFields> => {
-  const result: Record<string, unknown> = {};
-  for (const key of Object.keys(body)) {
-    if (ALLOWED_PROJECT_FIELDS.has(key)) {
-      result[key] = body[key];
-    }
-  }
-  return result as Partial<WritableProjectFields>;
-};
-
-export const validateWritableProjectFields = (
-  fields: Partial<WritableProjectFields>,
-): { ok: true } | { ok: false; errors: FieldTypeError[] } => {
-  const result = typia.validate<WritableProjectFields>(fields);
-  if (result.success) {
-    return { ok: true };
-  }
-  return {
-    ok: false,
-    errors: result.errors.map((e) => ({ path: e.path, expected: e.expected })),
-  };
-};
-
-/** Only these fields may be set on a tag via the REST API — see ALLOWED_TASK_FIELDS. */
-export const ALLOWED_TAG_FIELDS = new Set<string>(['title', 'icon']);
-
-export interface WritableTagFields {
-  title?: string;
-  icon?: string | null;
-}
-
-export const pickAllowedTagFields = (
-  body: Record<string, unknown>,
-): Partial<WritableTagFields> => {
-  const result: Record<string, unknown> = {};
-  for (const key of Object.keys(body)) {
-    if (ALLOWED_TAG_FIELDS.has(key)) {
-      result[key] = body[key];
-    }
-  }
-  return result as Partial<WritableTagFields>;
-};
-
-export const validateWritableTagFields = (
-  fields: Partial<WritableTagFields>,
-): { ok: true } | { ok: false; errors: FieldTypeError[] } => {
-  const result = typia.validate<WritableTagFields>(fields);
-  if (result.success) {
-    return { ok: true };
-  }
-  return {
-    ok: false,
-    errors: result.errors.map((e) => ({ path: e.path, expected: e.expected })),
-  };
-};
-
 /**
  * Only these fields may be set on a task-repeat-cfg via the REST API. Deliberately
  * excludes every recurrence-computation field (repeatCycle, weekday flags,
@@ -493,33 +427,43 @@ export const resolveDeadlineChange = (
   };
 };
 
-const MAX_ADD_TIME_MS = 24 * 60 * 60 * 1000;
+/** One day cannot hold more tracked time than this. */
+export const MAX_TIME_SPENT_PER_DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Validates `POST /tasks/:id/time` bodies: `{ date: 'YYYY-MM-DD', duration: ms }`.
- * Returns the parsed values, or an error message for a 400 response.
+ * `todayStr` is the logical today (DateService); later dates are rejected.
+ * Returns the parsed values, or the error code and message for a 400 response.
  */
 export const parseAddTimeSpentBody = (
   body: unknown,
-): { date: string; duration: number } | { error: string } => {
+  todayStr: string,
+): { date: string; duration: number } | { code: string; error: string } => {
   if (!isRecord(body)) {
-    return { error: 'Body must be an object with date and duration' };
+    const error = 'Body must be a JSON object with date and duration';
+    return { code: 'INVALID_INPUT', error };
+  }
+  const unknownField = Object.keys(body).find((k) => k !== 'date' && k !== 'duration');
+  if (unknownField) {
+    const error = `${unknownField} is not supported — only date and duration`;
+    return { code: 'UNSUPPORTED_FIELD', error };
   }
   const { date, duration } = body;
-  if (
-    typeof date !== 'string' ||
-    !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
-    Number.isNaN(Date.parse(`${date}T00:00:00Z`))
-  ) {
-    return { error: 'date must be a valid YYYY-MM-DD string' };
+  if (typeof date !== 'string' || !isValidDBDateStr(date)) {
+    return { code: 'INVALID_INPUT', error: 'date must be a valid YYYY-MM-DD date' };
+  }
+  // YYYY-MM-DD strings compare in calendar order.
+  if (date > todayStr) {
+    return { code: 'INVALID_INPUT', error: 'date must not be after today' };
   }
   if (
     typeof duration !== 'number' ||
     !Number.isInteger(duration) ||
     duration <= 0 ||
-    duration > MAX_ADD_TIME_MS
+    duration > MAX_TIME_SPENT_PER_DAY_MS
   ) {
-    return { error: 'duration must be a positive integer of milliseconds, at most 24h' };
+    const error = 'duration must be a positive integer of milliseconds, at most 24h';
+    return { code: 'INVALID_INPUT', error };
   }
   return { date, duration };
 };

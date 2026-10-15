@@ -49,16 +49,13 @@ import {
   validateWritableFields,
   firstRejectedField,
   SUBTASK_INHERITED_FIELDS,
-  pickAllowedProjectFields,
-  validateWritableProjectFields,
-  pickAllowedTagFields,
-  validateWritableTagFields,
   getQueryParam,
   getQueryParamAsBoolean,
   createErrorResponse,
   createSuccessResponse,
   TaskSource,
   isTaskInToday,
+  MAX_TIME_SPENT_PER_DAY_MS,
   parseAddTimeSpentBody,
   readIsIgnoreShortSyntax,
   isIncluded,
@@ -177,36 +174,11 @@ export class LocalRestApiHandlerService {
       return this._handleListProjects(requestId, query);
     }
 
-    if (method === 'POST' && path === '/projects') {
-      return this._handleCreateProject(requestId, body);
-    }
-
-    if (segments[0] === 'projects' && segments[1] && segments.length === 2) {
-      if (method === 'DELETE') {
-        return this._handleDeleteProject(requestId, segments[1]);
-      }
-      if (method === 'PATCH') {
-        return this._handleUpdateProject(requestId, segments[1], body);
-      }
-    }
-
     if (method === 'GET' && path === '/tags') {
       return this._handleListTags(requestId, query);
     }
 
-    if (method === 'POST' && path === '/tags') {
-      return this._handleCreateTag(requestId, body);
-    }
-
-    if (segments[0] === 'tags' && segments[1] && segments.length === 2) {
-      if (method === 'PATCH') {
-        return this._handleUpdateTag(requestId, segments[1], body);
-      }
-      if (method === 'DELETE') {
-        return this._handleDeleteTag(requestId, segments[1]);
-      }
-    }
-
+    // Tag and project writes (POST, PATCH, DELETE) are feature-owned routes.
     for (const routes of this._featureRoutes) {
       const response = await routes.handle(payload);
       if (response) {
@@ -703,12 +675,24 @@ export class LocalRestApiHandlerService {
     }
 
     if (segments.length === 3 && segments[2] === 'time' && method === 'POST') {
+      const parsed = parseAddTimeSpentBody(body, this._dateService.todayStr());
+      if ('error' in parsed) {
+        return createErrorResponse(requestId, 400, parsed.code, parsed.error);
+      }
       const task = await this._getTaskById(taskId);
-      const parsed = parseAddTimeSpentBody(body);
-      if (!task)
+      if (!task) {
         return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
-      if ('error' in parsed)
-        return createErrorResponse(requestId, 400, 'INVALID_INPUT', parsed.error);
+      }
+      // A parent's time is recomputed from its subtasks, so time logged on it is lost.
+      if (task.subTaskIds?.length) {
+        const msg = 'Task has subtasks and its time is their sum; log time on a subtask';
+        return createErrorResponse(requestId, 400, 'INVALID_INPUT', msg);
+      }
+      const dayTotal = (task.timeSpentOnDay?.[parsed.date] || 0) + parsed.duration;
+      if (dayTotal > MAX_TIME_SPENT_PER_DAY_MS) {
+        const msg = 'Time spent on one day cannot exceed 24h';
+        return createErrorResponse(requestId, 400, 'INVALID_INPUT', msg);
+      }
       this._featureBridge.addTimeSpentOnDay(task, parsed.duration, parsed.date);
       return createSuccessResponse(requestId, 200, await this._getTaskById(taskId));
     }
@@ -784,133 +768,6 @@ export class LocalRestApiHandlerService {
     return createSuccessResponse(requestId, 200, projects);
   }
 
-  /**
-   * Only `title` is writable on project creation via the REST API — every
-   * other Project field (theme, taskIds, advancedCfg, ...) is either
-   * derived/managed by the app or has no legitimate external write path, so
-   * this mirrors ALLOWED_TASK_FIELDS' minimal-surface approach rather than
-   * exposing Partial<Project> wholesale.
-   */
-  private async _handleCreateProject(
-    requestId: string,
-    body: unknown,
-  ): Promise<LocalRestApiResponsePayload> {
-    if (!isRecord(body) || typeof body.title !== 'string' || !body.title.trim()) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'Project title must be a non-empty string',
-      );
-    }
-
-    const title = body.title.trim();
-    const projectId = this._projectService.add({ title });
-    const created = await firstValueFrom(
-      this._projectService.getByIdOnceCatchError$(projectId),
-    );
-
-    return createSuccessResponse(requestId, 201, created);
-  }
-
-  /**
-   * Refuses to delete a non-empty project rather than silently cascading the
-   * deletion onto its tasks — REST API callers have no task-level visibility
-   * into what "delete project" would take with it, so an empty check keeps
-   * this a safe, narrow-scope operation instead of a hidden bulk-delete.
-   */
-  private async _handleDeleteProject(
-    requestId: string,
-    projectId: string,
-  ): Promise<LocalRestApiResponsePayload> {
-    if (projectId === 'INBOX_PROJECT') {
-      return createErrorResponse(
-        requestId,
-        400,
-        'UNSUPPORTED_FIELD',
-        'The Inbox project cannot be deleted',
-      );
-    }
-
-    const project = await firstValueFrom(
-      this._projectService.getByIdOnceCatchError$(projectId),
-    );
-    if (!project || project.id !== projectId) {
-      return createErrorResponse(
-        requestId,
-        404,
-        'PROJECT_NOT_FOUND',
-        'Project not found',
-      );
-    }
-
-    if (project.taskIds.length > 0 || project.backlogTaskIds.length > 0) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'PROJECT_NOT_EMPTY',
-        'Project has tasks — move or delete them first, then delete the project',
-      );
-    }
-
-    await this._projectService.remove(project);
-    return createSuccessResponse(requestId, 200, { deleted: true, id: projectId });
-  }
-
-  private async _handleUpdateProject(
-    requestId: string,
-    projectId: string,
-    body: unknown,
-  ): Promise<LocalRestApiResponsePayload> {
-    if (!isRecord(body)) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'PATCH body must be a JSON object',
-      );
-    }
-
-    if ('title' in body && (typeof body.title !== 'string' || !body.title.trim())) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'title must be a non-empty string',
-      );
-    }
-
-    const changes = pickAllowedProjectFields(body);
-    const validation = validateWritableProjectFields(changes);
-    if (!validation.ok) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'One or more project fields have an invalid type',
-        validation.errors,
-      );
-    }
-
-    const project = await firstValueFrom(
-      this._projectService.getByIdOnceCatchError$(projectId),
-    );
-    if (!project || project.id !== projectId) {
-      return createErrorResponse(
-        requestId,
-        404,
-        'PROJECT_NOT_FOUND',
-        'Project not found',
-      );
-    }
-
-    this._projectService.update(projectId, changes);
-    const updated = await firstValueFrom(
-      this._projectService.getByIdOnceCatchError$(projectId),
-    );
-    return createSuccessResponse(requestId, 200, updated);
-  }
-
   private async _handleListTags(
     requestId: string,
     query: Record<string, string | string[]>,
@@ -925,115 +782,6 @@ export class LocalRestApiHandlerService {
     }
 
     return createSuccessResponse(requestId, 200, tags);
-  }
-
-  private async _handleCreateTag(
-    requestId: string,
-    body: unknown,
-  ): Promise<LocalRestApiResponsePayload> {
-    if (!isRecord(body) || typeof body.title !== 'string' || !body.title.trim()) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'Tag title must be a non-empty string',
-      );
-    }
-
-    const additionalFields = pickAllowedTagFields(body);
-    const validation = validateWritableTagFields(additionalFields);
-    if (!validation.ok) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'One or more tag fields have an invalid type',
-        validation.errors,
-      );
-    }
-
-    const tagId = this._tagService.addTag({
-      title: body.title.trim(),
-      ...additionalFields,
-    });
-    const created = await firstValueFrom(this._tagService.getTagById$(tagId));
-    return createSuccessResponse(requestId, 201, created);
-  }
-
-  private async _handleUpdateTag(
-    requestId: string,
-    tagId: string,
-    body: unknown,
-  ): Promise<LocalRestApiResponsePayload> {
-    if (tagId === TODAY_TAG.id) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'UNSUPPORTED_FIELD',
-        'The Today tag is virtual and cannot be modified',
-      );
-    }
-
-    if (!isRecord(body)) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'PATCH body must be a JSON object',
-      );
-    }
-
-    if ('title' in body && (typeof body.title !== 'string' || !body.title.trim())) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'title must be a non-empty string',
-      );
-    }
-
-    const changes = pickAllowedTagFields(body);
-    const validation = validateWritableTagFields(changes);
-    if (!validation.ok) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'INVALID_INPUT',
-        'One or more tag fields have an invalid type',
-        validation.errors,
-      );
-    }
-
-    const tag = await firstValueFrom(this._tagService.getTagById$(tagId));
-    if (!tag || tag.id !== tagId) {
-      return createErrorResponse(requestId, 404, 'TAG_NOT_FOUND', 'Tag not found');
-    }
-
-    this._tagService.updateTag(tagId, changes);
-    const updated = await firstValueFrom(this._tagService.getTagById$(tagId));
-    return createSuccessResponse(requestId, 200, updated);
-  }
-
-  private async _handleDeleteTag(
-    requestId: string,
-    tagId: string,
-  ): Promise<LocalRestApiResponsePayload> {
-    if (tagId === TODAY_TAG.id) {
-      return createErrorResponse(
-        requestId,
-        400,
-        'UNSUPPORTED_FIELD',
-        'The Today tag is virtual and cannot be deleted',
-      );
-    }
-
-    const tag = await firstValueFrom(this._tagService.getTagById$(tagId));
-    if (!tag || tag.id !== tagId) {
-      return createErrorResponse(requestId, 404, 'TAG_NOT_FOUND', 'Tag not found');
-    }
-
-    this._tagService.deleteTag(tagId);
-    return createSuccessResponse(requestId, 200, { deleted: true, id: tagId });
   }
 
   /**

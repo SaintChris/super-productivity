@@ -8,7 +8,6 @@ import { addSubTask } from './store/task.actions';
 import { Task } from './task.model';
 import { TaskService } from './task.service';
 import { isTaskOverdue } from './util/is-task-overdue';
-import { syncTimeSpent } from '../time-tracking/store/time-tracking.actions';
 
 /** Features-side implementation of `LOCAL_REST_API_FEATURE_BRIDGE`. */
 @Injectable()
@@ -39,10 +38,8 @@ export class LocalRestApiFeatureBridgeService implements LocalRestApiFeatureBrid
     return task.id;
   }
 
-  /** Same pair as `TaskService.addTimeSpentAndSync`, but for any day. */
   addTimeSpentOnDay(task: Task, durationMs: number, date: string): void {
-    this._taskService.addTimeSpent(task, durationMs, date);
-    this._store.dispatch(syncTimeSpent({ taskId: task.id, date, duration: durationMs }));
+    this._taskService.addTimeSpentAndSync(task, durationMs, date);
   }
 
   isTaskOverdue(task: Task, todayStr: string, startOfNextDayDiffMs: number): boolean {
