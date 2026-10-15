@@ -199,44 +199,6 @@ export const validateWritableTagFields = (
   };
 };
 
-/** Only these fields may be set on a note via the REST API — see ALLOWED_TASK_FIELDS. */
-export const ALLOWED_NOTE_FIELDS = new Set<string>([
-  'content',
-  'projectId',
-  'isPinnedToToday',
-]);
-
-export interface WritableNoteFields {
-  content?: string;
-  projectId?: string | null;
-  isPinnedToToday?: boolean;
-}
-
-export const pickAllowedNoteFields = (
-  body: Record<string, unknown>,
-): Partial<WritableNoteFields> => {
-  const result: Record<string, unknown> = {};
-  for (const key of Object.keys(body)) {
-    if (ALLOWED_NOTE_FIELDS.has(key)) {
-      result[key] = body[key];
-    }
-  }
-  return result as Partial<WritableNoteFields>;
-};
-
-export const validateWritableNoteFields = (
-  fields: Partial<WritableNoteFields>,
-): { ok: true } | { ok: false; errors: FieldTypeError[] } => {
-  const result = typia.validate<WritableNoteFields>(fields);
-  if (result.success) {
-    return { ok: true };
-  }
-  return {
-    ok: false,
-    errors: result.errors.map((e) => ({ path: e.path, expected: e.expected })),
-  };
-};
-
 /**
  * Only these fields may be set on a task-repeat-cfg via the REST API. Deliberately
  * excludes every recurrence-computation field (repeatCycle, weekday flags,
