@@ -712,11 +712,14 @@ PluginAPI.registerIssueProvider({
       const calendarId = getTimeBlockCalendarId(cfg);
       const gcalEventId = taskIdToGcalEventId(taskId);
       const summary = eventData.isDone ? `[DONE] ${eventData.title}` : eventData.title;
+      // Time blocks are private: anyone who can see the calendar sees "busy",
+      // not the task title. Sent on every patch too, so older blocks follow.
       const body = {
         id: gcalEventId,
         summary,
         start: { dateTime: toUTCISO(eventData.dueWithTime) },
         end: { dateTime: toUTCISO(eventData.dueWithTime + eventData.durationMs) },
+        visibility: 'private',
         extendedProperties: { private: { spTaskId: taskId } },
       };
 
@@ -724,6 +727,7 @@ PluginAPI.registerIssueProvider({
         summary: body.summary,
         start: body.start,
         end: body.end,
+        visibility: body.visibility,
       };
       const patch = (): Promise<unknown> =>
         http.patch(eventUrl(calendarId, gcalEventId), patchBody);

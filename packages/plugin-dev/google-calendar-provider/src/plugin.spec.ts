@@ -558,6 +558,7 @@ describe('Google Calendar Plugin', () => {
       expect(body.summary).toBe('My Task');
       expect(body.start.dateTime).toBeDefined();
       expect(body.end.dateTime).toBeDefined();
+      expect(body.visibility).toBe('private');
     });
 
     it('falls back to insert with the full body when the event does not exist (patch 404)', async () => {
@@ -576,6 +577,7 @@ describe('Google Calendar Plugin', () => {
       expect(postUrl).toContain('/calendars/cal-1/events');
       expect(postBody.id).toBeDefined();
       expect(postBody.extendedProperties.private.spTaskId).toBe('task-1');
+      expect(postBody.visibility).toBe('private');
     });
 
     it('recovers when a concurrent create wins the race (insert returns 409)', async () => {
