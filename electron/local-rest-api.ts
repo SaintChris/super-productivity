@@ -24,11 +24,14 @@ import {
   LOCAL_REST_API_HOST,
   LOCAL_REST_API_MAX_BODY_BYTES,
   LOCAL_REST_API_MAX_CONCURRENT_REQUESTS,
-  LOCAL_REST_API_PORT,
   LOCAL_REST_API_TIMEOUT_MS,
   LocalRestApiRequestPayload,
   LocalRestApiResponsePayload,
 } from './shared-with-frontend/local-rest-api.model';
+import { getLocalRestApiPort } from './shared-with-frontend/get-local-rest-api-port';
+
+// Read once at startup: `--rest-api-port=` or SP_LOCAL_REST_API_PORT, default 3876.
+const PORT = getLocalRestApiPort(process.argv, process.env);
 
 const JSON_HEADERS = {
   /* eslint-disable-next-line @typescript-eslint/naming-convention */
@@ -484,8 +487,8 @@ const handleResponse = (_event: unknown, payload: LocalRestApiResponsePayload): 
 };
 
 const ALLOWED_HOSTS = new Set([
-  `${LOCAL_REST_API_HOST}:${LOCAL_REST_API_PORT}`,
-  `localhost:${LOCAL_REST_API_PORT}`,
+  `${LOCAL_REST_API_HOST}:${PORT}`,
+  `localhost:${PORT}`,
   LOCAL_REST_API_HOST,
   'localhost',
 ]);
@@ -700,7 +703,7 @@ export const initLocalRestApi = (): void => {
     isListening = false;
     if (error.code === 'EADDRINUSE') {
       warn(
-        `[local-rest-api] Port ${LOCAL_REST_API_PORT} is in use — API could not start. ` +
+        `[local-rest-api] Port ${PORT} is in use — API could not start. ` +
           `Another process is holding it; free it and toggle the API off/on to retry.`,
       );
       return;
@@ -731,11 +734,9 @@ const startServer = (): void => {
     return;
   }
 
-  server.listen(LOCAL_REST_API_PORT, LOCAL_REST_API_HOST, () => {
+  server.listen(PORT, LOCAL_REST_API_HOST, () => {
     isListening = true;
-    log(
-      `[local-rest-api] Listening on http://${LOCAL_REST_API_HOST}:${LOCAL_REST_API_PORT}`,
-    );
+    log(`[local-rest-api] Listening on http://${LOCAL_REST_API_HOST}:${PORT}`);
   });
 };
 
