@@ -4,7 +4,7 @@ import { firstValueFrom } from 'rxjs';
 import { TaskArchiveService } from '../archive/task-archive.service';
 import { DateService } from '../../core/date/date.service';
 import { isRecord } from '../../core/electron/local-rest-api-body';
-import { LOCAL_REST_API_FEATURE_BRIDGE } from '../../core/electron/local-rest-api-feature-bridge';
+import { LOCAL_REST_API_FEATURE_BRIDGE } from './local-rest-api-feature-bridge';
 import { LocalRestApiFeatureRoutes } from '../../core/electron/local-rest-api-feature-routes';
 import {
   createErrorResponse,

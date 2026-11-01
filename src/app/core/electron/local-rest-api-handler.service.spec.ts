@@ -12,7 +12,7 @@ import { IssueLog } from '../log';
 import {
   LOCAL_REST_API_FEATURE_BRIDGE,
   LocalRestApiFeatureBridge,
-} from './local-rest-api-feature-bridge';
+} from '../../features/tasks/local-rest-api-feature-bridge';
 import {
   LOCAL_REST_API_FEATURE_ROUTES,
   LocalRestApiFeatureRoutes,

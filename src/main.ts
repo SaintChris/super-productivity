@@ -90,7 +90,7 @@ import { OperationWriteFlushService } from './app/op-log/sync/operation-write-fl
 import { TaskService } from './app/features/tasks/task.service';
 import { LocalRestApiFeatureBridgeService } from './app/features/tasks/local-rest-api-feature-bridge.service';
 import { LocalRestApiTaskRoutesService } from './app/features/tasks/local-rest-api-task-routes.service';
-import { LOCAL_REST_API_FEATURE_BRIDGE } from './app/core/electron/local-rest-api-feature-bridge';
+import { LOCAL_REST_API_FEATURE_BRIDGE } from './app/features/tasks/local-rest-api-feature-bridge';
 import { LOCAL_REST_API_FEATURE_ROUTES } from './app/core/electron/local-rest-api-feature-routes';
 import { LocalRestApiTaskRepeatCfgRoutesService } from './app/features/task-repeat-cfg/local-rest-api-task-repeat-cfg-routes.service';
 import { LocalRestApiNoteRoutesService } from './app/features/note/local-rest-api-note-routes.service';
