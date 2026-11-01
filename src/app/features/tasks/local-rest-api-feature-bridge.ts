@@ -1,9 +1,9 @@
 import { InjectionToken } from '@angular/core';
+import { Task } from './task.model';
 
 /**
- * Feature calls the Local REST API handler makes without importing features/
- * (core/ must not — see FEATURE_LAYER_FENCE in eslint.config.js). Provided
- * from the features side in main.ts.
+ * Helpers the task routes use without growing TaskService, which is already
+ * over the size cap. Provided from main.ts.
  */
 export interface LocalRestApiFeatureBridge {
   /** Web link to the issue a task was imported from; '' when there is none. */
@@ -14,17 +14,14 @@ export interface LocalRestApiFeatureBridge {
   ): Promise<string>;
 
   /** Adds a subtask whose title is kept as is (no short syntax); returns its id. */
-  addLiteralSubTask(parentId: string, fields: object): string;
+  addLiteralSubTask(parentId: string, fields: Partial<Task>): string;
 
   /**
    * Adds time spent on `date` (YYYY-MM-DD) the way the app's own tracking
    * does, so `timeSpentOnDay`, the parent roll-up and sync stay consistent.
    * A past day is back-filled: no work start/end and no auto-plan for today.
    */
-  addTimeSpentOnDay(task: object, durationMs: number, date: string): void;
-
-  /** Whether the task's due date lies before the logical "today". */
-  isTaskOverdue(task: object, todayStr: string, startOfNextDayDiffMs: number): boolean;
+  addTimeSpentOnDay(task: Task, durationMs: number, date: string): void;
 }
 
 export const LOCAL_REST_API_FEATURE_BRIDGE =
