@@ -1,9 +1,9 @@
 import { InjectionToken } from '@angular/core';
 
 /**
- * Feature calls the Local REST API handler makes without importing features/
- * (core/ must not — see FEATURE_LAYER_FENCE in eslint.config.js). Provided
- * from the features side in main.ts.
+ * Helpers the task routes use without growing TaskService, which is already
+ * over the size cap. Provided from main.ts. The overdue check is not here:
+ * `?overdue=true` calls `isTaskOverdue` on the task route module.
  */
 export interface LocalRestApiFeatureBridge {
   /** Web link to the issue a task was imported from; '' when there is none. */
@@ -22,9 +22,6 @@ export interface LocalRestApiFeatureBridge {
    * A past day is back-filled: no work start/end and no auto-plan for today.
    */
   addTimeSpentOnDay(task: object, durationMs: number, date: string): void;
-
-  /** Whether the task's due date lies before the logical "today". */
-  isTaskOverdue(task: object, todayStr: string, startOfNextDayDiffMs: number): boolean;
 }
 
 export const LOCAL_REST_API_FEATURE_BRIDGE =

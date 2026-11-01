@@ -2,6 +2,7 @@ import { TestBed } from '@angular/core/testing';
 import { MockStore, provideMockStore } from '@ngrx/store/testing';
 import { of } from 'rxjs';
 import { LocalRestApiHandlerService } from './local-rest-api-handler.service';
+import { LocalRestApiTaskRoutesService } from '../../features/tasks/local-rest-api-task-routes.service';
 import { TaskService } from '../../features/tasks/task.service';
 import { TaskArchiveService } from '../../features/archive/task-archive.service';
 import { ProjectService } from '../../features/project/project.service';
@@ -225,7 +226,7 @@ describe('LocalRestApiHandlerService', () => {
 
     featureBridgeMock = jasmine.createSpyObj<LocalRestApiFeatureBridge>(
       'LocalRestApiFeatureBridge',
-      ['issueLink', 'addLiteralSubTask', 'addTimeSpentOnDay', 'isTaskOverdue'],
+      ['issueLink', 'addLiteralSubTask', 'addTimeSpentOnDay'],
     );
     featureBridgeMock.issueLink.and.returnValue(Promise.resolve(''));
 
@@ -234,6 +235,7 @@ describe('LocalRestApiHandlerService', () => {
     TestBed.configureTestingModule({
       providers: [
         LocalRestApiHandlerService,
+        LocalRestApiTaskRoutesService,
         { provide: TaskService, useValue: taskServiceMock },
         { provide: TaskArchiveService, useValue: taskArchiveServiceMock },
         { provide: ProjectService, useValue: projectServiceMock },
@@ -245,6 +247,7 @@ describe('LocalRestApiHandlerService', () => {
       ],
     });
 
+    featureRoutes.unshift(TestBed.inject(LocalRestApiTaskRoutesService));
     service = TestBed.inject(LocalRestApiHandlerService);
     store = TestBed.inject(MockStore);
     dispatchSpy = spyOn(store, 'dispatch');

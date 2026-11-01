@@ -7,7 +7,6 @@ import { IssueProviderKey } from '../issue/issue.model';
 import { addSubTask } from './store/task.actions';
 import { Task } from './task.model';
 import { TaskService } from './task.service';
-import { isTaskOverdue } from './util/is-task-overdue';
 
 /** Features-side implementation of `LOCAL_REST_API_FEATURE_BRIDGE`. */
 @Injectable()
@@ -40,9 +39,5 @@ export class LocalRestApiFeatureBridgeService implements LocalRestApiFeatureBrid
 
   addTimeSpentOnDay(task: Task, durationMs: number, date: string): void {
     this._taskService.addTimeSpentAndSync(task, durationMs, date);
-  }
-
-  isTaskOverdue(task: Task, todayStr: string, startOfNextDayDiffMs: number): boolean {
-    return isTaskOverdue(task, todayStr, startOfNextDayDiffMs);
   }
 }
