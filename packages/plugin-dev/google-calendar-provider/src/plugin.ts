@@ -53,6 +53,7 @@ interface GoogleCalendarConfig {
   showDeclinedEvents?: boolean;
   isAutoTimeBlock?: boolean;
   timeBlockCalendarId?: string;
+  isTimeBlockPrivate?: boolean;
   // Legacy field — migrated at runtime
   calendarId?: string;
 }
@@ -244,6 +245,13 @@ const withRateLimitRetry = async <T>(fn: () => Promise<T>): Promise<T> => {
 
 const isDeclined = (event: GoogleCalendarEvent): boolean =>
   event.attendees?.some((a) => a.self && a.responseStatus === 'declined') ?? false;
+
+/**
+ * Title of every time block while `isTimeBlockPrivate` is on, so the task title
+ * never reaches Google. Safe because time blocks are matched by their
+ * deterministic event ID and never read back (see `isSpManagedEvent`).
+ */
+const PRIVATE_TIME_BLOCK_TITLE = 'Focus time';
 
 /**
  * True for events SuperProductivity itself wrote as auto-time-block mirrors of a
@@ -469,6 +477,14 @@ PluginAPI.registerIssueProvider({
       showIf: 'isAutoTimeBlock',
       options: [{ label: 'Primary', value: 'primary' }],
       loadOptions: loadWritableCalendars,
+    },
+    {
+      key: 'isTimeBlockPrivate',
+      type: 'checkbox' as const,
+      label: 'Keep time blocks private',
+      description:
+        'Create time blocks as private events titled "Focus time", so people who can see this calendar never see your task titles.',
+      showIf: 'isAutoTimeBlock',
     },
   ],
 
@@ -770,12 +786,18 @@ PluginAPI.registerIssueProvider({
       const cfg = migrateConfig(config);
       const calendarId = getTimeBlockCalendarId(cfg);
       const gcalEventId = taskIdToGcalEventId(taskId);
-      const summary = eventData.isDone ? `[DONE] ${eventData.title}` : eventData.title;
+      const title = cfg.isTimeBlockPrivate ? PRIVATE_TIME_BLOCK_TITLE : eventData.title;
+      const summary = eventData.isDone ? `[DONE] ${title}` : title;
+      // Private: others see only "busy". Also sent on every patch, so blocks made
+      // before the setting was turned on follow. When off, visibility is not sent
+      // and Google keeps the event's current value.
+      const visibility = cfg.isTimeBlockPrivate ? { visibility: 'private' } : {};
       const body = {
         id: gcalEventId,
         summary,
         start: { dateTime: toUTCISO(eventData.dueWithTime) },
         end: { dateTime: toUTCISO(eventData.dueWithTime + eventData.durationMs) },
+        ...visibility,
         extendedProperties: { private: { spTaskId: taskId } },
       };
 
@@ -783,6 +805,7 @@ PluginAPI.registerIssueProvider({
         summary: body.summary,
         start: body.start,
         end: body.end,
+        ...visibility,
       };
       const patch = (): Promise<unknown> =>
         http.patch(eventUrl(calendarId, gcalEventId), patchBody);
