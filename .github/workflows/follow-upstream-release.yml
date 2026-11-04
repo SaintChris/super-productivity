@@ -1,0 +1,153 @@
+name: Follow upstream release
+
+# Rebuilds test/start-minimized-on-installed onto the latest upstream release.
+# The branch list is .github/fork-follow-branches.txt. Fast unit tests and lint
+# run only after a clean rebuild. There is no ntfy step and no ntfy secret:
+# a conflict or a test failure opens one waiting-for-alex issue, and a VPS job
+# collects those issues. A dry-run plans the rebuild and stops there.
+
+on:
+  schedule:
+    # 08:00 America/Jamaica (UTC-5, no daylight saving). The 11 PM night build
+    # then sees a branch that passed. GitHub may start a cron late.
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Plan only. No push and no issue.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: follow-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  follow:
+    name: Follow upstream release
+    if: github.repository == 'SaintChris/super-productivity'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Copy the follow script out of the checkout
+        run: |
+          cp .github/scripts/fork-follow-release.sh "$RUNNER_TEMP/fork-follow-release.sh"
+          cp .github/fork-follow-branches.txt "$RUNNER_TEMP/fork-follow-branches.txt"
+          chmod +x "$RUNNER_TEMP/fork-follow-release.sh"
+
+      - name: Prepare the rebuild
+        id: prepare
+        env:
+          BUILD_BRANCH: test/start-minimized-on-installed
+          BRANCHES_FILE: ${{ runner.temp }}/fork-follow-branches.txt
+          RESULT_FILE: ${{ runner.temp }}/fork-follow-result.env
+          FORK_SLUG: SaintChris/super-productivity
+          UPSTREAM_SLUG: super-productivity/super-productivity
+          UPSTREAM_FETCH_URL: https://github.com/super-productivity/super-productivity.git
+        run: |
+          set -euo pipefail
+          dry=0
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+            dry=1
+          fi
+          DRY_RUN=$dry "$RUNNER_TEMP/fork-follow-release.sh" prepare
+
+      - name: Install dependencies
+        if: steps.prepare.outputs.status == 'rebuilt' && steps.prepare.outputs.dry_run != '1'
+        uses: ./.github/actions/setup-deps
+
+      - name: Fast unit tests and lint
+        id: tests
+        if: steps.prepare.outputs.status == 'rebuilt' && steps.prepare.outputs.dry_run != '1'
+        run: |
+          set -euo pipefail
+          fail() {
+            printf '%s\n' "$1" >"$RUNNER_TEMP/test-failure.txt"
+            exit 1
+          }
+          chrome=$(command -v google-chrome || command -v google-chrome-stable || true)
+          [[ -n "$chrome" ]] || fail "google-chrome missing"
+          "$chrome" --version
+          export CHROME_BIN=$chrome
+          npm run env || fail "npm run env"
+          npm run lint || fail "npm run lint"
+          npm run test:electron || fail "npm run test:electron"
+          npm run packages:test || fail "npm run packages:test"
+          npm run test:fast || fail "npm run test:fast"
+
+      - name: Publish the build branch
+        if: steps.prepare.outputs.status == 'rebuilt' && steps.prepare.outputs.dry_run != '1' && steps.tests.outcome == 'success'
+        env:
+          BUILD_BRANCH: test/start-minimized-on-installed
+          RESULT_FILE: ${{ runner.temp }}/fork-follow-result.env
+          FORK_SLUG: SaintChris/super-productivity
+          UPSTREAM_SLUG: super-productivity/super-productivity
+        run: "$RUNNER_TEMP/fork-follow-release.sh" publish
+
+      - name: Open one waiting-for-alex issue
+        id: issue
+        if: always() && !cancelled() && steps.prepare.outputs.dry_run != '1' && (steps.prepare.outputs.status == 'conflict' || steps.tests.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ steps.prepare.outputs.release }}
+          BASE: ${{ steps.prepare.outputs.base }}
+          BUILD_BRANCH: test/start-minimized-on-installed
+          OLD_HEAD: ${{ steps.prepare.outputs.old_head }}
+          FAILED_BRANCH: ${{ steps.prepare.outputs.failed_branch }}
+          CONFLICT_KIND: ${{ steps.prepare.outputs.conflict_kind }}
+          STATUS: ${{ steps.prepare.outputs.status }}
+          FILES: ${{ steps.prepare.outputs.files }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Release follow stopped: ${RELEASE}"
+          if ! gh label list --limit 200 --json name --jq '.[] | select(.name == "waiting-for-alex") | .name' | grep -qx waiting-for-alex; then
+            gh label create waiting-for-alex --color fbca04 --description "Needs Alex before an automatic job can continue"
+          fi
+          existing=$(gh issue list --state open --label waiting-for-alex --limit 200 --json number,title \
+            --jq "[.[] | select(.title == \"${title}\") | .number][0] // empty")
+          if [[ -n "$existing" ]]; then
+            echo "fork-follow: issue #${existing} is already open"
+            echo "created=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "The release follow did not update \`${BUILD_BRANCH}\`."
+            echo
+            echo "- Release: ${RELEASE}"
+            echo "- Previous base: ${BASE}"
+            echo "- Build branch: \`${BUILD_BRANCH}\` unchanged at \`${OLD_HEAD}\`"
+            if [[ "$STATUS" == "conflict" ]]; then
+              echo "- Stopped on: \`${FAILED_BRANCH}\` (${CONFLICT_KIND} conflict)"
+            else
+              echo "- Stopped on: tests"
+              if [[ -f "$RUNNER_TEMP/test-failure.txt" ]]; then
+                echo "- Failed command: \`$(head -n 1 "$RUNNER_TEMP/test-failure.txt")\`"
+              fi
+            fi
+            echo "- Run: ${RUN_URL}"
+            echo
+            if [[ "$STATUS" == "conflict" && -n "$FILES" && -f "$FILES" ]]; then
+              echo "Files:"
+              sed 's/^/- /' "$FILES"
+              echo
+            fi
+            echo "Branch order is \`.github/fork-follow-branches.txt\` on master."
+            echo "The 11 PM build keeps the unchanged branch."
+          } >"$RUNNER_TEMP/fork-follow-issue.md"
+          gh issue create --title "$title" --label waiting-for-alex --body-file "$RUNNER_TEMP/fork-follow-issue.md"
+          echo "created=true" >>"$GITHUB_OUTPUT"
+
+      - name: Fail the run when a new issue was opened
+        if: steps.issue.outputs.created == 'true'
+        run: exit 1

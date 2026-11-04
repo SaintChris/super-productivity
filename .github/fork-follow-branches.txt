@@ -1,0 +1,23 @@
+# Night-build branch: test/start-minimized-on-installed
+# Applied oldest first, on top of the upstream release tag (not master).
+# A conflict stops the run. Nothing is pushed, and the build branch stays where it is.
+# The tip of each branch is what gets applied.
+#
+# Merge when the branch point on upstream master is already in the release.
+# Otherwise cherry-pick only the commits that are not in upstream master,
+# so a branch cut from later master does not drag unreleased upstream history in.
+#
+# Not applied, on purpose:
+# - feat/rest-api-port-flag: the same --rest-api-port change, retargeted at
+#   upstream master for PR 11432.
+# - feat/gcal-hide-time-block-titles: the calendar title setting, upstream PR 11438.
+#   It replaces the hardcoded "Focus time" commit, which is still what the
+#   installed build runs.
+# - feat/gcal-private-time-blocks-option: abandoned.
+# - The Wayland idle helper is a pinned binary the night build copies in.
+#   It is not a git branch. The source is already upstream.
+
+port/rest-api-v19.2
+feat/rest-api-port
+feat/gcal-private-time-blocks
+feat/start-minimized
