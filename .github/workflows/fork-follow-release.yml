@@ -5,21 +5,12 @@ name: Follow upstream release
 # run only after a clean rebuild. There is no ntfy step and no ntfy secret:
 # a conflict or a test failure opens one waiting-for-alex issue, and a VPS job
 # collects those issues. A dry-run plans the rebuild and stops there.
-# GitHub records workflow_dispatch when it has parsed this file. A file
-# first stored while the fork Actions banner was up stays unparsed after
-# later pushes: the API name remains the filename and dispatch returns
-# 422. A pull_request run reads the file from the branch and registers
-# the triggers. The job does nothing on that event.
 
 on:
   schedule:
     # 08:00 America/Jamaica (UTC-5, no daylight saving). The 11 PM night build
     # then sees a branch that passed. GitHub may start a cron late.
     - cron: '0 13 * * *'
-  pull_request:
-    branches: [master]
-    paths:
-      - .github/workflows/fork-follow-release.yml
   workflow_dispatch:
     inputs:
       dry_run:
@@ -38,7 +29,7 @@ concurrency:
 jobs:
   follow:
     name: Follow upstream release
-    if: github.repository == 'SaintChris/super-productivity' && github.event_name != 'pull_request'
+    if: github.repository == 'SaintChris/super-productivity'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -101,11 +92,14 @@ jobs:
           RESULT_FILE: ${{ runner.temp }}/fork-follow-result.env
           FORK_SLUG: SaintChris/super-productivity
           UPSTREAM_SLUG: super-productivity/super-productivity
-        run: "$RUNNER_TEMP/fork-follow-release.sh" publish
+        # The whole command is one quoted string. A bare
+        # run: "$script" publish ends the YAML string at the second quote,
+        # and GitHub then never registers workflow_dispatch.
+        run: '"$RUNNER_TEMP/fork-follow-release.sh" publish'
 
       - name: Open one waiting-for-alex issue
         id: issue
-        if: always() && !cancelled() && steps.prepare.outputs.dry_run != '1' && (steps.prepare.outputs.status == 'conflict' || steps.tests.outcome == 'failure')
+        if: ${{ always() && !cancelled() && steps.prepare.outputs.dry_run != '1' && (steps.prepare.outputs.status == 'conflict' || steps.tests.outcome == 'failure') }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ steps.prepare.outputs.release }}
