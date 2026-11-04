@@ -18,6 +18,7 @@ test('the REST harness loads current TypeScript even after an Electron build', (
     'mcp/mcp-tools',
     'mcp/mcp-tool-kit',
     'mcp/mcp-protocol',
+    'shared-with-frontend/get-local-rest-api-port',
   ]) {
     assert.equal(path.extname(require.resolve(`./${dependency}`)), '.ts');
   }
@@ -225,6 +226,9 @@ const coldDependencyPaths = [
   'mcp/mcp-tool-kit',
   'mcp/mcp-tools',
   'mcp/mcp-protocol',
+  // Reads the mocked port at import time. A cached copy would keep the first
+  // test's port and every later isolated server would bind the wrong one.
+  'shared-with-frontend/get-local-rest-api-port',
 ].map((file) => path.resolve(__dirname, file));
 
 const loadModule = (ctx) => {
