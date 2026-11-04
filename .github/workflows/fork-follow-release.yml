@@ -5,10 +5,6 @@ name: Follow upstream release
 # run only after a clean rebuild. There is no ntfy step and no ntfy secret:
 # a conflict or a test failure opens one waiting-for-alex issue, and a VPS job
 # collects those issues. A dry-run plans the rebuild and stops there.
-# GitHub records workflow_dispatch only when this file is pushed to the
-# default branch. The first copy landed while the fork Actions banner was
-# up, and a later edit of that same path was not parsed (the API name
-# stayed the filename). This file is the new path that gets parsed.
 
 on:
   schedule:
@@ -96,11 +92,14 @@ jobs:
           RESULT_FILE: ${{ runner.temp }}/fork-follow-result.env
           FORK_SLUG: SaintChris/super-productivity
           UPSTREAM_SLUG: super-productivity/super-productivity
-        run: "$RUNNER_TEMP/fork-follow-release.sh" publish
+        # The whole command is one quoted string. A bare
+        # run: "$script" publish ends the YAML string at the second quote,
+        # and GitHub then never registers workflow_dispatch.
+        run: '"$RUNNER_TEMP/fork-follow-release.sh" publish'
 
       - name: Open one waiting-for-alex issue
         id: issue
-        if: always() && !cancelled() && steps.prepare.outputs.dry_run != '1' && (steps.prepare.outputs.status == 'conflict' || steps.tests.outcome == 'failure')
+        if: ${{ always() && !cancelled() && steps.prepare.outputs.dry_run != '1' && (steps.prepare.outputs.status == 'conflict' || steps.tests.outcome == 'failure') }}
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ steps.prepare.outputs.release }}
