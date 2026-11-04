@@ -255,6 +255,36 @@ expect_refuse() {
   fi
 }
 
+echo "case latest release comes from the public API"
+mkdir -p "$ROOT/bin"
+cat >"$ROOT/bin/gh" <<'EOF'
+#!/bin/sh
+echo "gh must not run in prepare" >&2
+exit 4
+EOF
+cat >"$ROOT/bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' '{"tag_name":"v1.1.0"}'
+EOF
+chmod +x "$ROOT/bin/gh" "$ROOT/bin/curl"
+set_build "$(cat "$ROOT/old-pin-sha")"
+reset_work
+write_branches port/clean
+(
+  cd "$ROOT/work"
+  env -u RELEASE_TAG PATH="$ROOT/bin:$PATH" \
+    ALLOW_LOCAL_ORIGIN=1 \
+    UPSTREAM_FETCH_URL="$ROOT/upstream" \
+    BUILD_BRANCH=test/start-minimized-on-installed \
+    BRANCHES_FILE="$ROOT/branches.txt" \
+    RESULT_FILE="$ROOT/result.env" \
+    DRY_RUN=0 \
+    bash "$SCRIPT" prepare
+)
+load_result
+assert_eq "$status" rebuilt "api release status"
+assert_eq "$release" v1.1.0 "api release tag"
+
 echo "case refuse upstream"
 reset_work
 set_build "$(cat "$ROOT/old-pin-sha")"
