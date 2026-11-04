@@ -238,7 +238,13 @@ describe('LocalRestApiHandlerService', () => {
 
     featureBridgeMock = jasmine.createSpyObj<LocalRestApiFeatureBridge>(
       'LocalRestApiFeatureBridge',
-      ['issueLink', 'addLiteralSubTask', 'addTimeSpentOnDay', 'moveTaskToProject'],
+      [
+        'issueLink',
+        'addLiteralSubTask',
+        'addTimeSpentOnDay',
+        'moveTaskToProject',
+        'isTaskOverdue',
+      ],
     );
     featureBridgeMock.issueLink.and.returnValue(Promise.resolve(''));
 
@@ -906,6 +912,25 @@ describe('LocalRestApiHandlerService', () => {
         ).toEqual(['due-day', 'due-time']);
       });
 
+      it('should filter to tasks the bridge reports as overdue', async () => {
+        const tasks = [createMockTask('overdue'), createMockTask('later')];
+        Object.defineProperty(taskServiceMock, 'allTasks$', { get: () => of(tasks) });
+        featureBridgeMock.isTaskOverdue.and.callFake(
+          (task: object) => (task as Task).id === 'overdue',
+        );
+
+        const response = await sendRequestAndWait(
+          createRequest('GET', '/tasks', { query: { overdue: 'true' } }),
+        );
+
+        expectTaskIds(response, ['overdue']);
+        expect(featureBridgeMock.isTaskOverdue).toHaveBeenCalledWith(
+          jasmine.objectContaining({ id: 'overdue' }),
+          '2026-05-12',
+          0,
+        );
+      });
+
       it('should exclude done tasks by default', async () => {
         const tasks = [
           createMockTask('task-1', { isDone: false }),
@@ -984,6 +1009,8 @@ describe('LocalRestApiHandlerService', () => {
           'New Task',
           false,
           jasmine.any(Object),
+          false,
+          true,
         );
       });
 
@@ -1006,10 +1033,16 @@ describe('LocalRestApiHandlerService', () => {
           }),
         );
 
-        expect(taskServiceMock.add).toHaveBeenCalledWith('Deadline task', false, {
-          title: 'Deadline task',
-          notes: 'created through REST',
-        });
+        expect(taskServiceMock.add).toHaveBeenCalledWith(
+          'Deadline task',
+          false,
+          {
+            title: 'Deadline task',
+            notes: 'created through REST',
+          },
+          false,
+          true,
+        );
         expect(dispatchSpy).toHaveBeenCalledOnceWith(
           TaskSharedActions.setDeadline({
             taskId: 'new-task-id',
@@ -1102,10 +1135,16 @@ describe('LocalRestApiHandlerService', () => {
           }),
         );
 
-        expect(taskServiceMock.add).toHaveBeenCalledWith('New Task', false, {
-          title: 'New Task',
-          notes: 'allowed',
-        });
+        expect(taskServiceMock.add).toHaveBeenCalledWith(
+          'New Task',
+          false,
+          {
+            title: 'New Task',
+            notes: 'allowed',
+          },
+          false,
+          true,
+        );
       });
 
       it('should return 400 when an allowed field has an invalid type', async () => {
@@ -1235,14 +1274,31 @@ describe('LocalRestApiHandlerService', () => {
           expect(dispatchSpy).not.toHaveBeenCalled();
         });
 
-        it('should keep parsing by default', async () => {
+        it('should store a title literally when the flag is omitted', async () => {
           await sendRequestAndWait(
             createRequest('PATCH', '/tasks/task-1', { body: { title: 'Renamed #tag' } }),
+          );
+
+          expect(taskServiceMock.update).not.toHaveBeenCalled();
+          expect(dispatchSpy).toHaveBeenCalledOnceWith(
+            TaskSharedActions.updateTask({
+              task: { id: 'task-1', changes: { title: 'Renamed #tag' } },
+              isIgnoreShortSyntax: true,
+            }),
+          );
+        });
+
+        it('should parse a title when isIgnoreShortSyntax is false', async () => {
+          await sendRequestAndWait(
+            createRequest('PATCH', '/tasks/task-1', {
+              body: { title: 'Renamed #tag', isIgnoreShortSyntax: false },
+            }),
           );
 
           expect(taskServiceMock.update).toHaveBeenCalledWith('task-1', {
             title: 'Renamed #tag',
           });
+          expect(dispatchSpy).not.toHaveBeenCalled();
         });
       });
 
@@ -1258,6 +1314,8 @@ describe('LocalRestApiHandlerService', () => {
               id === 'parent-1' ? of(parentTask) : of(newSubTask),
           });
 
+          featureBridgeMock.addLiteralSubTask.and.returnValue('new-subtask-id');
+
           const response = await sendRequestAndWait(
             createRequest('POST', '/tasks', {
               body: { title: 'Child', parentId: 'parent-1', notes: 'child notes' },
@@ -1266,10 +1324,11 @@ describe('LocalRestApiHandlerService', () => {
 
           expect(response.body.ok).toBe(true);
           expect(response.status).toBe(201);
-          expect(taskServiceMock.addSubTaskTo).toHaveBeenCalledWith('parent-1', {
+          expect(featureBridgeMock.addLiteralSubTask).toHaveBeenCalledWith('parent-1', {
             title: 'Child',
             notes: 'child notes',
           });
+          expect(taskServiceMock.addSubTaskTo).not.toHaveBeenCalled();
           expect(taskServiceMock.add).not.toHaveBeenCalled();
         });
 
@@ -1285,6 +1344,8 @@ describe('LocalRestApiHandlerService', () => {
               id === 'parent-1' ? of(parentTask) : of(newSubTask),
           });
 
+          featureBridgeMock.addLiteralSubTask.and.returnValue('new-subtask-id');
+
           const response = await sendRequestAndWait(
             createRequest('POST', '/tasks', {
               body: {
@@ -1295,9 +1356,10 @@ describe('LocalRestApiHandlerService', () => {
             }),
           );
 
-          expect(taskServiceMock.addSubTaskTo).toHaveBeenCalledWith('parent-1', {
+          expect(featureBridgeMock.addLiteralSubTask).toHaveBeenCalledWith('parent-1', {
             title: 'Child with deadline',
           });
+          expect(taskServiceMock.addSubTaskTo).not.toHaveBeenCalled();
           expect(dispatchSpy).toHaveBeenCalledOnceWith(
             TaskSharedActions.setDeadline({
               taskId: 'new-subtask-id',
@@ -1616,9 +1678,12 @@ describe('LocalRestApiHandlerService', () => {
         );
 
         expect(response.body.ok).toBe(true);
-        expect(taskServiceMock.update).toHaveBeenCalledWith(
-          'task-1',
-          jasmine.any(Object),
+        expect(taskServiceMock.update).not.toHaveBeenCalled();
+        expect(dispatchSpy).toHaveBeenCalledOnceWith(
+          TaskSharedActions.updateTask({
+            task: { id: 'task-1', changes: { title: 'Updated Title' } },
+            isIgnoreShortSyntax: true,
+          }),
         );
       });
 
@@ -2018,10 +2083,15 @@ describe('LocalRestApiHandlerService', () => {
           }),
         );
 
-        expect(taskServiceMock.update).toHaveBeenCalledOnceWith('task-1', {
-          title: 'Updated title',
-        });
-        expect(dispatchSpy).toHaveBeenCalledOnceWith(
+        expect(taskServiceMock.update).not.toHaveBeenCalled();
+        expect(dispatchSpy).toHaveBeenCalledTimes(2);
+        expect(dispatchSpy).toHaveBeenCalledWith(
+          TaskSharedActions.updateTask({
+            task: { id: 'task-1', changes: { title: 'Updated title' } },
+            isIgnoreShortSyntax: true,
+          }),
+        );
+        expect(dispatchSpy).toHaveBeenCalledWith(
           TaskSharedActions.setDeadline({
             taskId: 'task-1',
             deadlineDay: '2026-05-13',
@@ -2103,9 +2173,13 @@ describe('LocalRestApiHandlerService', () => {
           }),
         );
 
-        expect(taskServiceMock.update).toHaveBeenCalledWith('task-1', {
-          title: 'Updated',
-        });
+        expect(taskServiceMock.update).not.toHaveBeenCalled();
+        expect(dispatchSpy).toHaveBeenCalledOnceWith(
+          TaskSharedActions.updateTask({
+            task: { id: 'task-1', changes: { title: 'Updated' } },
+            isIgnoreShortSyntax: true,
+          }),
+        );
       });
 
       it('should reject parentId in PATCH body with 400', async () => {
@@ -2201,9 +2275,13 @@ describe('LocalRestApiHandlerService', () => {
         );
 
         expect(response.body.ok).toBe(true);
-        expect(taskServiceMock.update).toHaveBeenCalledOnceWith('task-1', {
-          title: 'Renamed',
-        });
+        expect(taskServiceMock.update).not.toHaveBeenCalled();
+        expect(dispatchSpy).toHaveBeenCalledOnceWith(
+          TaskSharedActions.updateTask({
+            task: { id: 'task-1', changes: { title: 'Renamed' } },
+            isIgnoreShortSyntax: true,
+          }),
+        );
       });
 
       it('should move the task and then apply the other fields', async () => {

@@ -9,6 +9,7 @@ import { addSubTask } from './store/task.actions';
 import { Task } from './task.model';
 import { TaskMoveToProjectService } from './task-move-to-project.service';
 import { TaskService } from './task.service';
+import { isTaskOverdue as isTaskOverdueUtil } from './util/is-task-overdue';
 
 /** Features-side implementation of `LOCAL_REST_API_FEATURE_BRIDGE`. */
 @Injectable()
@@ -51,5 +52,9 @@ export class LocalRestApiFeatureBridgeService implements LocalRestApiFeatureBrid
         isSkipConfirm: true,
       });
     }
+  }
+
+  isTaskOverdue(task: Task, todayStr: string, startOfNextDayDiffMs: number): boolean {
+    return isTaskOverdueUtil(task, todayStr, startOfNextDayDiffMs);
   }
 }

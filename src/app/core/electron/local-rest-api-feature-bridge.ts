@@ -28,6 +28,9 @@ export interface LocalRestApiFeatureBridge {
    * recurring task's repeat config and instances follow it, without asking.
    */
   moveTaskToProject(taskId: string, projectId: string): Promise<void>;
+
+  /** Whether the task's due date lies before the logical "today". */
+  isTaskOverdue(task: object, todayStr: string, startOfNextDayDiffMs: number): boolean;
 }
 
 export const LOCAL_REST_API_FEATURE_BRIDGE =
