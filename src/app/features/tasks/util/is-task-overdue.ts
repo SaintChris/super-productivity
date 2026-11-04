@@ -21,9 +21,9 @@ export const getLogicalTodayStartMs = (
  * Overdue comparison against a *precomputed* logical start-of-today threshold.
  * This is the single source of truth for "what counts as overdue"; both
  * `isTaskOverdue` and `selectOverdueTaskIds` route through it so the two overdue
- * definitions can never drift. (`isTaskOverdue` currently has no production
- * caller — it is the tested, readable form of this pair and the entry point any
- * new caller should use.) Callers that iterate many tasks (the selector) compute
+ * definitions can never drift. `isTaskOverdue` is the entry point callers
+ * should use; the local REST API's `?overdue=true` filter goes through it.
+ * Callers that iterate many tasks (the selector) compute
  * the threshold once and pass it in, instead of per task.
  *
  * Priority follows the dueWithTime/dueDay mutual-exclusivity pattern.
