@@ -6,8 +6,9 @@ name: Follow upstream release
 # a conflict or a test failure opens one waiting-for-alex issue, and a VPS job
 # collects those issues. A dry-run plans the rebuild and stops there.
 # GitHub records workflow_dispatch only when this file is pushed to the
-# default branch. A copy that landed while the fork Actions banner was up
-# is not re-read until the next push, even after the web button is clicked.
+# default branch. The first copy landed while the fork Actions banner was
+# up, and a later edit of that same path was not parsed (the API name
+# stayed the filename). This file is the new path that gets parsed.
 
 on:
   schedule:
