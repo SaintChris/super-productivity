@@ -22,8 +22,9 @@ export const getLogicalTodayStartMs = (
  * This is the single source of truth for "what counts as overdue"; both
  * `isTaskOverdue` and `selectOverdueTaskIds` route through it so the two overdue
  * definitions can never drift. `isTaskOverdue` is the entry point, and the
- * Local REST `?overdue=true` filter calls it. Callers that iterate many tasks
- * (the selector) compute the threshold once and pass it in, instead of per task.
+ * Local REST `?overdue=true` filter goes through it. Callers that iterate many
+ * tasks (the selector) compute the threshold once and pass it in, instead of
+ * per task.
  *
  * Priority follows the dueWithTime/dueDay mutual-exclusivity pattern.
  */

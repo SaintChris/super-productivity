@@ -1,4 +1,5 @@
 import { Injectable, inject } from '@angular/core';
+import { toSignal } from '@angular/core/rxjs-interop';
 import { Store } from '@ngrx/store';
 import { firstValueFrom } from 'rxjs';
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
@@ -17,6 +18,7 @@ import {
   selectTimeRemaining,
   selectTimer,
 } from '../../features/focus-mode/store/focus-mode.selectors';
+import { DataInitStateService } from '../data-init/data-init-state.service';
 import { LOCAL_REST_API_FEATURE_ROUTES } from './local-rest-api-feature-routes';
 import { createErrorResponse, createSuccessResponse } from './local-rest-api-response';
 import {
@@ -47,6 +49,13 @@ export class LocalRestApiHandlerService {
   private readonly _featureRoutes =
     inject(LOCAL_REST_API_FEATURE_ROUTES, { optional: true }) ?? [];
   private readonly _store = inject(Store);
+  // The main process only knows the renderer has booted, which happens before
+  // the data is loaded — answering then would serve an empty task list as if it
+  // were the user's data, and let a write land on top of half-hydrated state.
+  private readonly _isDataLoaded = toSignal(
+    inject(DataInitStateService).isAllDataLoadedInitially$,
+    { initialValue: false },
+  );
   private _isInitialized = false;
 
   init(): void {
@@ -81,6 +90,15 @@ export class LocalRestApiHandlerService {
     payload: LocalRestApiRequestPayload,
   ): Promise<LocalRestApiResponsePayload> {
     const { method, path, requestId, query } = payload;
+
+    if (this._isDataLoaded() !== true) {
+      return createErrorResponse(
+        requestId,
+        503,
+        'APP_NOT_READY',
+        'App data is still loading',
+      );
+    }
 
     if (method === 'GET' && path === '/focus') {
       return this._handleGetFocus(requestId);

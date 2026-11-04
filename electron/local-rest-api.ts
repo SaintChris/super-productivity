@@ -1,47 +1,39 @@
 import { app, ipcMain } from 'electron';
 import { log, warn } from 'electron-log/main';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
-import { randomBytes, randomUUID, timingSafeEqual } from 'crypto';
-import {
-  chmodSync,
-  closeSync,
-  existsSync,
-  fchmodSync,
-  fstatSync,
-  fsyncSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-} from 'fs';
-import { dirname, join } from 'path';
+import { once } from 'events';
+import { randomBytes, randomUUID } from 'crypto';
+import { unlinkSync } from 'fs';
+import { join } from 'path';
+import { readSecretFile, writeSecretFile } from './secure-file';
+import { timingSafeEqualLenient } from './crypto-utils';
+import { readRequestBody, UNAUTHORIZED_HEADERS, writeJsonResponse } from './http-utils';
+import { initAssistantAccess, isAssistantAccessEnabled } from './mcp/assistant-access';
+import { handleMcpHttpRequest, McpHttpDeps } from './mcp/mcp-http';
+import { RendererTimeoutError } from './mcp/mcp-tools';
+import { ASSISTANT_ACCESS_PATH } from './shared-with-frontend/assistant-access.model';
 import { IPC } from './shared-with-frontend/ipc-events.const';
 import { getIsAppReady, getWin } from './main-window';
-import { GlobalConfigState } from '../src/app/features/config/global-config.model';
+import { loadSimpleStoreAll, saveSimpleStore } from './simple-store';
+import { SimpleStoreKey } from './shared-with-frontend/simple-store.const';
 import {
   LOCAL_REST_API_HOST,
   LOCAL_REST_API_MAX_BODY_BYTES,
   LOCAL_REST_API_MAX_CONCURRENT_REQUESTS,
   LOCAL_REST_API_TIMEOUT_MS,
+  LocalRestApiListenError,
   LocalRestApiRequestPayload,
   LocalRestApiResponsePayload,
+  LocalRestApiState,
 } from './shared-with-frontend/local-rest-api.model';
 import { getLocalRestApiPort } from './shared-with-frontend/get-local-rest-api-port';
 
 // Read once at startup: `--rest-api-port=` or SP_LOCAL_REST_API_PORT, default 3876.
 const PORT = getLocalRestApiPort(process.argv, process.env);
 
-const JSON_HEADERS = {
-  /* eslint-disable-next-line @typescript-eslint/naming-convention */
-  'Content-Type': 'application/json; charset=utf-8',
-};
-
 let server: Server | null = null;
 let isInitialized = false;
-let isEnabled = false;
-// What the renderer's saved setting asks for, which is not the same thing as
+// What the persisted device-local setting asks for, which is not the same thing as
 // what the main process managed to do about it: enabling fails closed when the
 // token cannot be stored, and the saved setting stays `true` regardless. Kept
 // apart so a later recovery can tell "the user wants this on" from "it is on".
@@ -50,11 +42,19 @@ let isEnabledDesired = false;
 // setting of `false` does not switch it off again on launch. Only an explicit
 // turn-off (the setting going from true to false) clears it.
 let isEnabledByTokenFile = false;
-// The last `isLocalRestApiEnabled` the renderer sent, or undefined before the
-// first config arrives. It is what tells "the user just switched it off" apart
-// from "the saved setting has always been off".
-let lastCfgEnabled: boolean | undefined = undefined;
 let isListening = false;
+// Set once the user toggles the API in this session, so the startup read of the
+// persisted setting can never overwrite a newer choice.
+let hasExplicitEnabledChoice = false;
+// Resolves once the persisted switch has been applied at startup.
+let startupRead: Promise<void> = Promise.resolve();
+// Why the last listen() failed, kept so the settings UI can say so instead of
+// showing a switched-on API that nothing serves. Cleared by the next start.
+let listenError: LocalRestApiListenError | undefined = undefined;
+// Set when enabling failed closed because the token could not be stored.
+let isTokenStorageFailed = false;
+/** Whether the REST API serves requests: wanted, and not failed closed. */
+const isEnabled = (): boolean => isEnabledDesired && !isTokenStorageFailed;
 const pendingRequests = new Map<
   string,
   {
@@ -99,188 +99,17 @@ const generateToken = (): string => {
 
 const getTokenFilePath = (): string =>
   join(app.getPath('userData'), 'local-rest-api-token');
+const TOKEN_LABEL = 'local REST API access token';
+
+const loadPersistedToken = (): string | undefined =>
+  readSecretFile(getTokenFilePath(), TOKEN_PATTERN, TOKEN_LABEL);
 
 /**
- * Restores the 0600 the token file is supposed to have, or reports that it
- * could not. A file that ends up group- or world-readable — restored from a
- * backup, copied with a permissive umask, moved off a filesystem that has no
- * modes — is otherwise served happily for as long as the user never presses
- * Regenerate, which is the one path that used to fix it.
+ * Writes the token or throws; the caller must never activate a token that did
+ * not reach the disk. See writeSecretFile() for how the write is made safe.
  */
-const restrictTokenFileMode = (filePath: string): boolean => {
-  // POSIX modes carry no meaning on Windows (`statSync` reports a synthesised
-  // 0666/0444 from the read-only flag); access there is governed by the ACL the
-  // file inherits from userData.
-  if (process.platform === 'win32') {
-    return true;
-  }
-  try {
-    if ((statSync(filePath).mode & 0o077) === 0) {
-      return true;
-    }
-    chmodSync(filePath, 0o600);
-    // chmod() is allowed to report success without changing anything — a CIFS
-    // mount without unix extensions is the documented case — so the one thing
-    // worth reading back is the mode it claims to have set. Without this the
-    // fail-closed path below never fires on exactly the filesystems that need
-    // it, and a world-readable credential is served as if it were locked down.
-    if ((statSync(filePath).mode & 0o077) !== 0) {
-      warn(
-        '[local-rest-api] The access token file is still readable by other accounts ' +
-          'after chmod — this filesystem does not enforce POSIX modes',
-      );
-      return false;
-    }
-    return true;
-  } catch (error) {
-    warn('[local-rest-api] Could not restrict the access token file mode', error);
-    return false;
-  }
-};
-
-const loadPersistedToken = (): string | undefined => {
-  try {
-    const filePath = getTokenFilePath();
-    if (!existsSync(filePath)) {
-      return undefined;
-    }
-    const token = readFileSync(filePath, 'utf8').trim();
-    // Only accept what generateToken() could have written: a truncated or
-    // otherwise corrupted file must not silently become the live credential.
-    if (!TOKEN_PATTERN.test(token)) {
-      warn(
-        '[local-rest-api] Ignoring malformed access token file — generating a new one',
-      );
-      return undefined;
-    }
-    // Fail closed if it cannot be locked down: discarding it mints a fresh
-    // token into a fresh 0600 file, which costs the user their old token but
-    // never keeps serving one that everyone on the machine can read.
-    if (!restrictTokenFileMode(filePath)) {
-      return undefined;
-    }
-    return token;
-  } catch (error) {
-    warn('[local-rest-api] Failed to read access token file', error);
-    return undefined;
-  }
-};
-
-/**
- * Tries to make the *directory entry* created by renameSync() durable. On POSIX the
- * rename is atomic but not crash-safe until the parent directory is fsynced, so
- * without this an abrupt power loss can bring the previous token back after a
- * regeneration that reported success — exactly the guarantee persistToken()
- * exists to make. Best effort by design, and therefore best-effort crash
- * resistance rather than a durability guarantee: the rename already happened
- * and the new token is on disk, so a filesystem that refuses to fsync a
- * directory must not turn a completed write into a failed one — the failure is
- * logged and the rotation still reports success.
- */
-const fsyncDirectory = (dirPath: string): void => {
-  // Windows has no directory-fsync equivalent — opening a directory for reading
-  // fails outright — and NTFS metadata ordering makes the rename durable anyway.
-  if (process.platform === 'win32') {
-    return;
-  }
-  let dirFd: number | undefined;
-  try {
-    dirFd = openSync(dirPath, 'r');
-    fsyncSync(dirFd);
-  } catch (error) {
-    warn('[local-rest-api] Could not fsync the access token directory', error);
-  } finally {
-    if (dirFd !== undefined) {
-      try {
-        closeSync(dirFd);
-      } catch {
-        // Nothing useful left to do with the descriptor.
-      }
-    }
-  }
-};
-
-/**
- * Writes the token or throws. Everything up to and including the rename is
- * deliberately not swallowed: the caller must never activate a token that did
- * not reach the disk. The directory fsync that follows the rename is the one
- * exception — the token is already on disk by then, so turning that into a
- * throw would report a failed rotation for a write that actually succeeded,
- * and leave the new token to go live on the next launch while the caller keeps
- * serving the old one. fsyncDirectory() logs instead.
- */
-const persistToken = (token: string): void => {
-  const filePath = getTokenFilePath();
-  // Write a sibling temp file and rename it into place. rename() is atomic, so
-  // a crash mid-write cannot leave a half-written token behind.
-  //
-  // The suffix is random and the open below is exclusive, because the temp path
-  // is the weak point of this sequence: a predictable name lets anyone who can
-  // create entries in this directory pre-plant a symlink there, and 'w' would
-  // follow it — writing the token into a file outside the profile and then
-  // renaming the *symlink* into place, so every later read and rotation stays
-  // redirected. 'wx' alone would close that, but on a pid-derived name it also
-  // refuses to run once a leftover temp from a hard kill is met by a run that
-  // draws the same pid, which needs stale-temp handling to undo. A random name
-  // has nothing to pre-plant and makes EEXIST unreachable in practice, so the
-  // two together need no such recovery. The trade is that a hard kill inside
-  // the window orphans a temp file — empty, partial, or the whole 32 bytes,
-  // depending on where it lands — that no later run reclaims.
-  //
-  // What this does not close: renameSync() resolves the name again rather than
-  // the open descriptor, so an attacker who renames the temp entry away after
-  // the open and leaves a symlink at that path still redirects the result. That
-  // needs a won race instead of a file planted at leisure, and it needs the
-  // authority to rename an entry this process owns — which a sticky directory
-  // denies even when it is world-writable, and which is enough to replace the
-  // token file itself where it is not.
-  const tmpFilePath = `${filePath}.${randomBytes(8).toString('hex')}.tmp`;
-  let fd: number | undefined;
-
-  try {
-    fd = openSync(tmpFilePath, 'wx', 0o600);
-    // `mode` is a request, not a guarantee: a filesystem that does not enforce
-    // POSIX modes can create the file group- or world-readable regardless.
-    fchmodSync(fd, 0o600);
-    // And verify it through the same descriptor rather than trusting the call:
-    // fchmod() can succeed without effect on a filesystem that does not enforce
-    // POSIX modes. Throwing keeps the write closed, so a token never goes live
-    // out of a file other accounts can read.
-    if (process.platform !== 'win32') {
-      const mode = fstatSync(fd).mode & 0o777;
-      if ((mode & 0o077) !== 0) {
-        throw new Error(
-          `Refusing to store the local REST API access token: the filesystem left ` +
-            `it at mode 0${mode.toString(8)} instead of 0600, so other accounts on ` +
-            `this machine could read it.`,
-        );
-      }
-    }
-    // Only now, once the descriptor is known to be private, does the secret
-    // reach the disk. Writing first would put it in a readable file for the
-    // length of the check on exactly the filesystems that check exists for.
-    writeFileSync(fd, token, 'utf8');
-    fsyncSync(fd);
-    closeSync(fd);
-    fd = undefined;
-    renameSync(tmpFilePath, filePath);
-    fsyncDirectory(dirname(filePath));
-  } catch (error) {
-    if (fd !== undefined) {
-      try {
-        closeSync(fd);
-      } catch {
-        // Already failing; nothing useful left to do with the descriptor.
-      }
-    }
-    try {
-      unlinkSync(tmpFilePath);
-    } catch {
-      // Best effort: there may be nothing to clean up.
-    }
-    throw error;
-  }
-};
+const persistToken = (token: string): void =>
+  writeSecretFile(getTokenFilePath(), token, TOKEN_LABEL);
 
 /**
  * Deletes the persisted token file. A present file auto-enables the API on the
@@ -314,6 +143,16 @@ const ensureToken = (): string => {
     const token = generateToken();
     persistToken(token);
     localRestApiToken = token;
+  } else if (isEnabledDesired && !isForceEnabledForDev()) {
+    // An explicit turn-off deletes the file and leaves this token in memory,
+    // so an in-flight request is still told the API is off. Enabling again
+    // has to put that same token back on disk. This does not run while the
+    // API is off, or opening settings would recreate the file and the next
+    // launch would auto-enable.
+    const onDisk = loadPersistedToken();
+    if (onDisk !== localRestApiToken) {
+      persistToken(localRestApiToken);
+    }
   }
   return localRestApiToken;
 };
@@ -330,46 +169,16 @@ const regenerateToken = (): string => {
   return token;
 };
 
-const compareToken = (input: string, expected: string): boolean => {
-  const inputBuffer = Buffer.from(input, 'utf8');
-  const expectedBuffer = Buffer.from(expected, 'utf8');
+const compareToken = (input: string, expected: string): boolean =>
+  timingSafeEqualLenient(Buffer.from(input, 'utf8'), Buffer.from(expected, 'utf8'));
 
-  if (inputBuffer.length !== expectedBuffer.length) {
-    // Perform a dummy comparison with expectedBuffer to mitigate timing attacks on length differences
-    timingSafeEqual(expectedBuffer, expectedBuffer);
-    return false;
-  }
-
-  return timingSafeEqual(inputBuffer, expectedBuffer);
-};
-
-const writeJson = (
-  res: ServerResponse,
-  status: number,
-  body: LocalRestApiResponsePayload['body'],
-  extraHeaders: Record<string, string> = {},
-): void => {
-  const responseJson = JSON.stringify(body);
-  res.writeHead(status, {
-    ...JSON_HEADERS,
-    // eslint-disable-next-line @typescript-eslint/naming-convention
-    'Content-Length': Buffer.byteLength(responseJson),
-    ...extraHeaders,
-  });
-  res.end(responseJson);
-};
-
-// RFC 7235 requires a challenge on every 401. It also tells the scripts written
-// against the unauthenticated API (v18.1.0 onwards) what to do, since this 401
-// is the only thing they will see after upgrading.
-const UNAUTHORIZED_HEADERS = {
-  /* eslint-disable-next-line @typescript-eslint/naming-convention */
-  'WWW-Authenticate': 'Bearer',
-};
+// The 401's WWW-Authenticate header (see UNAUTHORIZED_HEADERS in http-utils)
+// tells the scripts written against the unauthenticated API (v18.1.0 onwards)
+// what to do, since this 401 is the only thing they will see after upgrading.
 const TOKEN_LOCATION_HINT = 'Find the token in Settings → Misc → Access Token.';
 
 const respondUnauthorized = (res: ServerResponse, message: string): void => {
-  writeJson(
+  writeJsonResponse(
     res,
     401,
     {
@@ -382,6 +191,12 @@ const respondUnauthorized = (res: ServerResponse, message: string): void => {
     UNAUTHORIZED_HEADERS,
   );
 };
+
+const respondDisabled = (res: ServerResponse): void =>
+  writeJsonResponse(res, 503, {
+    ok: false,
+    error: { code: 'API_DISABLED', message: 'Local REST API is disabled' },
+  });
 
 const isCurrentToken = (candidate: string): boolean =>
   !!localRestApiToken && compareToken(candidate, localRestApiToken);
@@ -425,23 +240,16 @@ const parseBearerToken = (authHeader: string | undefined): string | undefined =>
 };
 
 const readJsonBody = async (req: IncomingMessage): Promise<unknown> => {
-  const chunks: Buffer[] = [];
-  let totalBytes = 0;
-
-  for await (const chunk of req) {
-    const bufferChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    totalBytes += bufferChunk.length;
-    if (totalBytes > LOCAL_REST_API_MAX_BODY_BYTES) {
-      throw new Error('Request body too large');
-    }
-    chunks.push(bufferChunk);
+  const raw = await readRequestBody(req, LOCAL_REST_API_MAX_BODY_BYTES);
+  if (raw === 'TOO_LARGE') {
+    throw new Error('Request body too large');
   }
 
-  if (!chunks.length) {
+  if (!raw.length) {
     return undefined;
   }
 
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  return JSON.parse(raw.toString('utf8'));
 };
 
 const getQueryObject = (url: URL): Record<string, string | string[]> => {
@@ -457,6 +265,7 @@ const getQueryObject = (url: URL): Record<string, string | string[]> => {
 
 const forwardRequestToRenderer = async (
   payload: LocalRestApiRequestPayload,
+  timeoutMs: number = LOCAL_REST_API_TIMEOUT_MS,
 ): Promise<LocalRestApiResponsePayload> => {
   const mainWindow = getWin();
 
@@ -464,7 +273,7 @@ const forwardRequestToRenderer = async (
     const timeout = setTimeout(() => {
       pendingRequests.delete(payload.requestId);
       reject(new Error('Renderer request timed out'));
-    }, LOCAL_REST_API_TIMEOUT_MS);
+    }, timeoutMs);
 
     pendingRequests.set(payload.requestId, {
       resolve,
@@ -515,28 +324,82 @@ const getForcedDevToken = (): string => {
   return generatedForcedDevToken;
 };
 
+const mcpDeps: McpHttpDeps = {
+  isAllowedHost: (host) => !!host && ALLOWED_HOSTS.has(host),
+  isAtConcurrencyLimit: () =>
+    pendingRequests.size >= LOCAL_REST_API_MAX_CONCURRENT_REQUESTS,
+  parseBearerToken: (header) => parseBearerToken(header),
+  serverVersion: app.getVersion(),
+  forward: async (request) => {
+    if (!getIsAppReady()) {
+      return {
+        status: 503,
+        body: { ok: false, error: { code: 'APP_NOT_READY', message: '' } },
+      };
+    }
+    try {
+      const response = await forwardRequestToRenderer(
+        {
+          requestId: randomUUID(),
+          method: request.method,
+          path: request.path,
+          query: request.query ?? {},
+          body: request.body,
+          ...(request.source ? { source: request.source } : {}),
+        },
+        request.timeoutMs,
+      );
+      return { status: response.status, body: response.body };
+    } catch (error) {
+      if (error instanceof Error && error.message === 'Renderer request timed out') {
+        throw new RendererTimeoutError();
+      }
+      throw error;
+    }
+  },
+};
+
+// `new URL` throws on request targets Node's parser accepts, such as `//`.
+const parseRequestUrl = (req: IncomingMessage): URL | undefined => {
+  try {
+    return new URL(req.url ?? '/', `http://${LOCAL_REST_API_HOST}`);
+  } catch {
+    return undefined;
+  }
+};
+
 const handleHttpRequest = async (
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> => {
+  const requestUrl = parseRequestUrl(req);
+  if (!requestUrl) {
+    writeJsonResponse(res, 400, {
+      ok: false,
+      error: { code: 'INVALID_URL', message: 'Invalid request target' },
+    });
+    return;
+  }
+
+  // The assistant endpoint shares this listener but not its switch, its
+  // credential or its (looser) Origin rule, so it is routed before any of them.
+  if (requestUrl.pathname === ASSISTANT_ACCESS_PATH) {
+    await handleMcpHttpRequest(req, res, mcpDeps);
+    return;
+  }
+
   // Reject everything while disabled. server.close() stops accepting new
   // sockets, but an in-flight keep-alive connection could still be served
   // during the close window; this makes the off switch immediate.
-  if (!isEnabled) {
-    writeJson(res, 503, {
-      ok: false,
-      error: {
-        code: 'API_DISABLED',
-        message: 'Local REST API is disabled',
-      },
-    });
+  if (!isEnabled()) {
+    respondDisabled(res);
     return;
   }
 
   // Block DNS rebinding: reject requests with unexpected Host headers
   const host = req.headers.host;
   if (!host || !ALLOWED_HOSTS.has(host)) {
-    writeJson(res, 403, {
+    writeJsonResponse(res, 403, {
       ok: false,
       error: {
         code: 'FORBIDDEN',
@@ -553,7 +416,7 @@ const handleHttpRequest = async (
   // closes that gap on top of the Host-header check above.
   const origin = req.headers.origin;
   if (origin && origin !== 'null') {
-    writeJson(res, 403, {
+    writeJsonResponse(res, 403, {
       ok: false,
       error: {
         code: 'FORBIDDEN',
@@ -564,7 +427,7 @@ const handleHttpRequest = async (
   }
 
   if (pendingRequests.size >= LOCAL_REST_API_MAX_CONCURRENT_REQUESTS) {
-    writeJson(res, 429, {
+    writeJsonResponse(res, 429, {
       ok: false,
       error: {
         code: 'TOO_MANY_REQUESTS',
@@ -574,11 +437,10 @@ const handleHttpRequest = async (
     return;
   }
 
-  const requestUrl = new URL(req.url ?? '/', `http://${LOCAL_REST_API_HOST}`);
   const method = req.method ?? 'GET';
 
   if (method === 'GET' && requestUrl.pathname === '/health') {
-    writeJson(res, 200, {
+    writeJsonResponse(res, 200, {
       ok: true,
       data: {
         server: 'up',
@@ -605,7 +467,7 @@ const handleHttpRequest = async (
   }
 
   if (!getIsAppReady()) {
-    writeJson(res, 503, {
+    writeJsonResponse(res, 503, {
       ok: false,
       error: {
         code: 'APP_NOT_READY',
@@ -619,7 +481,7 @@ const handleHttpRequest = async (
   try {
     body = await readJsonBody(req);
   } catch (error) {
-    writeJson(res, 400, {
+    writeJsonResponse(res, 400, {
       ok: false,
       error: {
         code: 'INVALID_REQUEST_BODY',
@@ -641,6 +503,13 @@ const handleHttpRequest = async (
     return;
   }
 
+  // Same for the off switch: the assistant endpoint can keep this listener up
+  // after REST is switched off, so a body still arriving must not run then.
+  if (!isEnabled()) {
+    respondDisabled(res);
+    return;
+  }
+
   try {
     const rendererResponse = await forwardRequestToRenderer({
       requestId: randomUUID(),
@@ -649,12 +518,12 @@ const handleHttpRequest = async (
       query: getQueryObject(requestUrl),
       body,
     });
-    writeJson(res, rendererResponse.status, rendererResponse.body);
+    writeJsonResponse(res, rendererResponse.status, rendererResponse.body);
   } catch (error) {
     warn('[local-rest-api] Request failed', requestUrl.pathname, error);
     const isTimeout =
       error instanceof Error && error.message === 'Renderer request timed out';
-    writeJson(res, isTimeout ? 504 : 500, {
+    writeJsonResponse(res, isTimeout ? 504 : 500, {
       ok: false,
       error: {
         code: isTimeout ? 'RENDERER_TIMEOUT' : 'INTERNAL_ERROR',
@@ -695,12 +564,49 @@ export const initLocalRestApi = (): void => {
     return token;
   });
 
+  ipcMain.handle(IPC.LOCAL_REST_API_GET_STATE, async () => {
+    await startupRead;
+    return getLocalRestApiState();
+  });
+  ipcMain.handle(IPC.LOCAL_REST_API_SET_ENABLED, async (_ev, enabled: unknown) => {
+    if (typeof enabled !== 'boolean') {
+      throw new Error('Invalid enabled value');
+    }
+    // Forced-dev mode ignores the setting entirely; writing it would change
+    // what the next normal launch does without the user having chosen that.
+    if (!isForceEnabledForDev()) {
+      await startupRead;
+      // Persist first: a switch that reports "off" but comes back on after a
+      // restart would break the one promise the off switch makes.
+      hasExplicitEnabledChoice = true;
+      await saveSimpleStore(SimpleStoreKey.LOCAL_REST_API_ENABLED, enabled);
+      applyLocalRestApiEnabled(enabled);
+      await settleAfterApply();
+    }
+    return getLocalRestApiState();
+  });
+
   server = createServer((req, res) => {
-    void handleHttpRequest(req, res);
+    handleHttpRequest(req, res).catch((error: unknown) => {
+      // An escaped rejection would reach start-app's uncaughtException handler,
+      // which exits the app. Log the code only: the message can carry request
+      // content.
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      warn('[local-rest-api] Request handler failed', code ?? 'UNKNOWN');
+      // A client that disconnected mid-upload has no socket left to answer on.
+      if (req.destroyed || res.headersSent) {
+        return;
+      }
+      writeJsonResponse(res, 500, {
+        ok: false,
+        error: { code: 'INTERNAL_ERROR', message: 'Internal error' },
+      });
+    });
   });
 
   server.on('error', (error: NodeJS.ErrnoException) => {
     isListening = false;
+    listenError = toListenError(error.code);
     if (error.code === 'EADDRINUSE') {
       warn(
         `[local-rest-api] Port ${PORT} is in use — API could not start. ` +
@@ -711,22 +617,77 @@ export const initLocalRestApi = (): void => {
     warn('[local-rest-api] Server error', error);
   });
 
+  initAssistantAccess({
+    onListenerNeedChanged: async () => {
+      if (isListenerWanted()) {
+        startServer();
+      } else {
+        stopServer();
+      }
+      await settleAfterApply();
+    },
+    getListenerStatus: () => ({
+      isListening,
+      ...(listenError ? { error: listenError } : {}),
+    }),
+  });
+
   if (isForceEnabledForDev()) {
     warn('[local-rest-api] Enabled by SP_FORCE_LOCAL_REST_API=1 for DEV runtime');
     localRestApiToken = getForcedDevToken();
-    isEnabled = true;
+    isEnabledDesired = true;
     startServer();
-  } else {
+    return;
+  }
+
+  startupRead = restorePersistedEnabled();
+};
+
+/**
+ * Applies the persisted switch once userData is final. initLocalRestApi() runs
+ * from initIpcInterfaces(), before start-app.ts applies --user-data-dir;
+ * reading earlier would restore another profile's setting.
+ */
+const restorePersistedEnabled = async (): Promise<void> => {
+  await app.whenReady();
+  const enabled = await readPersistedEnabled();
+  // A toggle that landed while the file was being read is newer than it.
+  if (hasExplicitEnabledChoice) {
+    return;
+  }
+  // initLocalRestApi() runs before --user-data-dir is applied, so the token
+  // file is read here, once userData is final. A file starts the API even
+  // when the saved switch is off: agents enable a profile by writing the file.
+  if (!isForceEnabledForDev()) {
     const persistedToken = loadPersistedToken();
     if (persistedToken) {
       log('[local-rest-api] Token file found on disk — auto-enabling API');
       localRestApiToken = persistedToken;
-      isEnabled = true;
-      isEnabledDesired = true;
       isEnabledByTokenFile = true;
-      startServer();
+      if (!enabled) {
+        log(
+          '[local-rest-api] Setting is off but a token file is present — keeping the API ' +
+            'on. Turn the setting on and off again to disable it.',
+        );
+      }
+      applyEnabled(true);
+      return;
     }
   }
+  applyEnabled(enabled);
+};
+
+const toListenError = (code: string | undefined): LocalRestApiListenError => {
+  if (code === 'EADDRINUSE') {
+    return 'PORT_IN_USE';
+  }
+  // A sandbox without the permission to accept connections (Mac App Store
+  // without com.apple.security.network.server, a Snap without network-bind)
+  // refuses the bind itself.
+  if (code === 'EPERM' || code === 'EACCES') {
+    return 'PERMISSION_DENIED';
+  }
+  return 'UNKNOWN';
 };
 
 const startServer = (): void => {
@@ -734,6 +695,7 @@ const startServer = (): void => {
     return;
   }
 
+  listenError = undefined;
   server.listen(PORT, LOCAL_REST_API_HOST, () => {
     isListening = true;
     log(`[local-rest-api] Listening on http://${LOCAL_REST_API_HOST}:${PORT}`);
@@ -746,19 +708,22 @@ const startServer = (): void => {
  * main process learns that storage works again — otherwise the setting reads
  * "enabled" while nothing listens, and stays that way until the next settings
  * change or restart. It cannot switch the API on by itself: `isEnabledDesired`
- * only ever comes from the saved setting.
+ * comes from the saved setting or from a token file found at startup.
  */
 const startServerIfDesired = (): void => {
-  if (!isEnabledDesired || isEnabled) {
+  if (!isTokenStorageFailed) {
     return;
   }
   log('[local-rest-api] Access token is available again — starting the server');
-  isEnabled = true;
+  isTokenStorageFailed = false;
   startServer();
 };
 
+/** The listener serves the REST API and assistant access; either keeps it up. */
+const isListenerWanted = (): boolean => isEnabled() || isAssistantAccessEnabled();
+
 const stopServer = (): void => {
-  if (!server || !isListening) {
+  if (!server || !isListening || isListenerWanted()) {
     return;
   }
 
@@ -781,35 +746,36 @@ const stopServer = (): void => {
   server.closeAllConnections();
 };
 
-export const updateLocalRestApiConfig = (cfg: GlobalConfigState): void => {
-  const isForcedForDev = isForceEnabledForDev();
-  const cfgEnabled = !!cfg.misc.isLocalRestApiEnabled;
-  const prevCfgEnabled = lastCfgEnabled;
-  lastCfgEnabled = cfgEnabled;
-
-  // Transition rule for the token-file auto-enable: only the setting going
-  // from true to false is a turn-off. The first config after launch carries
-  // whatever was saved, and a saved `false` must not stop an API the token
-  // file started — agents rely on it being up at launch. A real turn-off
-  // removes the file, so the next launch stays off until the user turns the
-  // setting on again, which mints a fresh token via ensureToken().
-  // Forced-dev mode never uses the file, so it is left alone there.
-  if (prevCfgEnabled === true && !cfgEnabled && !isForcedForDev) {
+/**
+ * Applies the enabled state in memory: mints the token if needed and starts or
+ * stops the listener. Persisting the choice is the caller's job — see the
+ * SET_ENABLED handler — so this stays synchronous and testable.
+ *
+ * The switch is deliberately owned by this device alone. It used to live in the
+ * synced misc config, which meant enabling the API on one computer started a
+ * listener on every other synced desktop the next time it sent its settings.
+ */
+export const applyLocalRestApiEnabled = (enabled: boolean): void => {
+  hasExplicitEnabledChoice = true;
+  // Only a real turn-off deletes the token file. A saved `false` at launch
+  // never reaches here while a token file is present: restorePersistedEnabled
+  // keeps the API on instead. Forced-dev mode does not use the file. The
+  // in-memory token stays so a request already being read still authenticates
+  // and is then refused as disabled; the file is what the next launch reads.
+  if ((isEnabledDesired || isEnabledByTokenFile) && !enabled && !isForceEnabledForDev()) {
     isEnabledByTokenFile = false;
-    localRestApiToken = undefined;
     removePersistedToken();
-  } else if (prevCfgEnabled === undefined && !cfgEnabled && isEnabledByTokenFile) {
-    log(
-      '[local-rest-api] Setting is off but a token file is present — keeping the API ' +
-        'on. Turn the setting on and off again to disable it.',
-    );
   }
+  applyEnabled(enabled);
+};
 
-  const nextEnabled = isForcedForDev || isEnabledByTokenFile || cfgEnabled;
-  isEnabledDesired = nextEnabled;
+const applyEnabled = (enabled: boolean): void => {
+  const isForcedForDev = isForceEnabledForDev();
+  isEnabledDesired = isForcedForDev || enabled;
+  isTokenStorageFailed = false;
   // Ensure a token exists whenever the server is (about to be) serving, so
   // enabling the API never starts an unreachable server with no credential.
-  if (nextEnabled) {
+  if (isEnabledDesired) {
     try {
       localRestApiToken = isForcedForDev ? getForcedDevToken() : ensureToken();
     } catch (error) {
@@ -817,24 +783,45 @@ export const updateLocalRestApiConfig = (cfg: GlobalConfigState): void => {
       // launch, so fail closed rather than start a server the user cannot keep
       // using. The renderer surfaces the failure when it reads the token.
       warn('[local-rest-api] Could not store the access token — not starting', error);
-      isEnabled = false;
-      stopServer();
-      return;
+      isTokenStorageFailed = true;
     }
   }
-  if (nextEnabled === isEnabled) {
-    if (nextEnabled && !isListening) {
-      startServer();
-    } else if (!nextEnabled && isListening) {
-      stopServer();
-    }
-    return;
-  }
-
-  isEnabled = nextEnabled;
-  if (isEnabled) {
+  if (isListenerWanted()) {
     startServer();
   } else {
+    listenError = undefined;
     stopServer();
+  }
+};
+
+export const getLocalRestApiState = (): LocalRestApiState => ({
+  isEnabled: isEnabledDesired,
+  isListening,
+  ...(isTokenStorageFailed
+    ? { error: 'TOKEN_STORAGE' as const }
+    : isEnabledDesired && listenError
+      ? { error: listenError }
+      : {}),
+});
+
+/** Resolves once a pending listen() has bound or failed (bounded, just in case). */
+const settleAfterApply = async (): Promise<void> => {
+  if (!server || !isListenerWanted() || isListening || listenError) {
+    return;
+  }
+  await Promise.race([
+    // Rejects on 'error'; listenError then carries the outcome.
+    once(server, 'listening').catch(() => undefined),
+    new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+  ]);
+};
+
+const readPersistedEnabled = async (): Promise<boolean> => {
+  try {
+    const all = await loadSimpleStoreAll();
+    return all[SimpleStoreKey.LOCAL_REST_API_ENABLED] === true;
+  } catch (error) {
+    warn('[local-rest-api] Could not read the enabled setting — staying off', error);
+    return false;
   }
 };

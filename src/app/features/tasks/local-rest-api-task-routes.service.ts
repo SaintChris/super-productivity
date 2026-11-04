@@ -2,6 +2,7 @@ import { Injectable, inject } from '@angular/core';
 import { Store } from '@ngrx/store';
 import { firstValueFrom } from 'rxjs';
 import { TaskArchiveService } from '../archive/task-archive.service';
+import { ArchiveOperationHandler } from '../../op-log/apply/archive-operation-handler.service';
 import { DateService } from '../../core/date/date.service';
 import { isRecord } from '../../core/electron/local-rest-api-body';
 import { LOCAL_REST_API_FEATURE_BRIDGE } from './local-rest-api-feature-bridge';
@@ -11,6 +12,7 @@ import {
   createSuccessResponse,
 } from '../../core/electron/local-rest-api-response';
 import { IssueLog } from '../../core/log';
+import { parseTimeSpentBody } from '../../core/electron/local-rest-api-task-time';
 import { ProjectService } from '../project/project.service';
 import { TODAY_TAG } from '../tag/tag.const';
 import { TaskSharedActions } from '../../root-store/meta/task-shared.actions';
@@ -32,7 +34,6 @@ import {
   hasOwn,
   isIncluded,
   isTaskInToday,
-  parseAddTimeSpentBody,
   pickAllowedFields,
   readIsIgnoreShortSyntax,
   resolveDeadlineChange,
@@ -41,7 +42,6 @@ import {
 } from './local-rest-api-task-routes.util';
 import { Task, TaskWithSubTasks } from './task.model';
 import { TaskService } from './task.service';
-import { isTaskOverdue } from './util/is-task-overdue';
 import { getDeadlineAutoPlanFields } from './util/get-deadline-auto-plan-fields';
 
 /** Local REST API routes for `/status`, `/task-control`, and `/tasks`. */
@@ -49,6 +49,7 @@ import { getDeadlineAutoPlanFields } from './util/get-deadline-auto-plan-fields'
 export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes {
   private readonly _taskService = inject(TaskService);
   private readonly _taskArchiveService = inject(TaskArchiveService);
+  private readonly _archiveOperationHandler = inject(ArchiveOperationHandler);
   private readonly _projectService = inject(ProjectService);
   private readonly _dateService = inject(DateService);
   private readonly _featureBridge = inject(LOCAL_REST_API_FEATURE_BRIDGE);
@@ -206,7 +207,14 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
     } else if (source === 'all') {
       tasks = await this._taskService.getAllTasksEverywhere();
     } else {
-      tasks = await firstValueFrom(this._taskService.allTasks$);
+      // Archiving a project leaves its tasks in the store; the app hides them
+      // everywhere, so "active" does too.
+      const [allTasks, archivedProjects] = await Promise.all([
+        firstValueFrom(this._taskService.allTasks$),
+        firstValueFrom(this._projectService.archived$),
+      ]);
+      const archivedIds = new Set(archivedProjects.map((p) => p.id));
+      tasks = allTasks.filter((t) => !t.projectId || !archivedIds.has(t.projectId));
     }
 
     let filtered = tasks;
@@ -231,7 +239,9 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
     if (overdue) {
       const todayStr = this._dateService.todayStr();
       const startOfNextDayDiffMs = this._dateService.getStartOfNextDayDiffMs();
-      filtered = filtered.filter((t) => isTaskOverdue(t, todayStr, startOfNextDayDiffMs));
+      filtered = filtered.filter((t) =>
+        this._featureBridge.isTaskOverdue(t, todayStr, startOfNextDayDiffMs),
+      );
     }
 
     if (!includeDone) {
@@ -395,7 +405,14 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
     if (segments.length === 2) {
       if (method === 'GET') {
         const task = await this._getTaskById(taskId);
-        if (!task) {
+        // `source=active` hides a task of an archived project, as the list does.
+        const isHidden =
+          !!task?.projectId &&
+          getQueryParam(query, 'source') === 'active' &&
+          (await firstValueFrom(this._projectService.archived$)).some(
+            (p) => p.id === task.projectId,
+          );
+        if (!task || isHidden) {
           return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
         }
         // Opt-in: some providers fetch the issue over the network to build
@@ -466,6 +483,12 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
         if (!task) {
           return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
         }
+        // An echoed `isDone: true` (GET→PATCH round trip) would only stamp a
+        // new `doneOn`: it moves the completion date and turns a won't-do task
+        // into a completed one.
+        if (changes.isDone === true && task.isDone) {
+          delete (changes as Record<string, unknown>).isDone;
+        }
 
         const deadlineFields = Object.fromEntries(
           DEADLINE_FIELDS.filter((field) => hasOwn(changes, field)).map((field) => [
@@ -486,6 +509,7 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
           delete changes[field];
         }
 
+        let isMoveOnly = false;
         if (hasOwn(changes, 'projectId')) {
           const targetProjectId = changes.projectId;
           if (typeof targetProjectId !== 'string' || !targetProjectId.trim()) {
@@ -523,10 +547,15 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
                 'Destination project not found or archived',
               );
             }
+            // Move it like the UI does, so a recurring task's config and other
+            // instances follow (#10675). A combined update below keeps projectId,
+            // now unchanged, so its change set and short syntax stay as sent.
+            await this._featureBridge.moveTaskToProject(taskId, targetProjectId);
+            isMoveOnly = Object.keys(changes).length === 1;
           }
         }
 
-        if (Object.keys(changes).length > 0) {
+        if (!isMoveOnly && Object.keys(changes).length > 0) {
           // Short syntax only parses a title-only change set, so that is the
           // only shape the flag changes; everything else keeps going through
           // update() and whatever bookkeeping it does.
@@ -570,8 +599,12 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
       return createSuccessResponse(requestId, 200, { currentTaskId: taskId });
     }
 
-    if (segments.length === 3 && segments[2] === 'time' && method === 'POST') {
-      const parsed = parseAddTimeSpentBody(body, this._dateService.todayStr());
+    if (
+      segments.length === 3 &&
+      segments[2] === 'time' &&
+      (method === 'POST' || method === 'PUT')
+    ) {
+      const parsed = parseTimeSpentBody(body, this._dateService.todayStr(), method);
       if ('error' in parsed) {
         return createErrorResponse(requestId, 400, parsed.code, parsed.error);
       }
@@ -584,11 +617,27 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
         const msg = 'Task has subtasks and its time is their sum; log time on a subtask';
         return createErrorResponse(requestId, 400, 'INVALID_INPUT', msg);
       }
+      if (method === 'PUT') {
+        const { date, duration } = parsed;
+        const previous = task.timeSpentOnDay?.[date];
+        if (duration !== (previous ?? 0) || (duration === 0 && previous !== undefined)) {
+          const timeSpentOnDay = { ...task.timeSpentOnDay };
+          if (duration === 0) {
+            delete timeSpentOnDay[date];
+          } else {
+            timeSpentOnDay[date] = duration;
+          }
+          // Same path as the time dialog: flush tracked time, then update totals.
+          this._taskService.update(taskId, { timeSpentOnDay });
+        }
+        return createSuccessResponse(requestId, 200, await this._getTaskById(taskId));
+      }
       const dayTotal = (task.timeSpentOnDay?.[parsed.date] || 0) + parsed.duration;
       if (dayTotal > MAX_TIME_SPENT_PER_DAY_MS) {
         const msg = 'Time spent on one day cannot exceed 24h';
         return createErrorResponse(requestId, 400, 'INVALID_INPUT', msg);
       }
+
       this._featureBridge.addTimeSpentOnDay(task, parsed.duration, parsed.date);
       return createSuccessResponse(requestId, 200, await this._getTaskById(taskId));
     }
@@ -644,6 +693,11 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
     }
 
     this._taskService.restoreTask(archivedTask, subTasks);
+    // The dispatch adds the task to the store; removing it from the archive
+    // runs afterwards as a queued side effect. Wait for it, so a 200 means the
+    // task has left the archive, the same as archive's 200 means it has
+    // entered it (#9952).
+    await this._archiveOperationHandler.whenLocalOperationsSettled();
     const restoredTask = await this._getTaskById(taskId);
     return createSuccessResponse(requestId, 200, restoredTask);
   }
