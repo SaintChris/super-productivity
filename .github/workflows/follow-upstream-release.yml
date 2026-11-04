@@ -5,6 +5,9 @@ name: Follow upstream release
 # run only after a clean rebuild. There is no ntfy step and no ntfy secret:
 # a conflict or a test failure opens one waiting-for-alex issue, and a VPS job
 # collects those issues. A dry-run plans the rebuild and stops there.
+# GitHub records workflow_dispatch only when this file is pushed to the
+# default branch. A copy that landed while the fork Actions banner was up
+# is not re-read until the next push, even after the web button is clicked.
 
 on:
   schedule:
