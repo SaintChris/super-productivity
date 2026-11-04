@@ -1,19 +1,22 @@
 import { Injectable, inject } from '@angular/core';
 import { Store } from '@ngrx/store';
+import { firstValueFrom } from 'rxjs';
 import { LocalRestApiFeatureBridge } from '../../core/electron/local-rest-api-feature-bridge';
 import { TaskLog } from '../../core/log';
 import { IssueService } from '../issue/issue.service';
 import { IssueProviderKey } from '../issue/issue.model';
 import { addSubTask } from './store/task.actions';
 import { Task } from './task.model';
+import { TaskMoveToProjectService } from './task-move-to-project.service';
 import { TaskService } from './task.service';
-import { isTaskOverdue } from './util/is-task-overdue';
+import { isTaskOverdue as isTaskOverdueUtil } from './util/is-task-overdue';
 
 /** Features-side implementation of `LOCAL_REST_API_FEATURE_BRIDGE`. */
 @Injectable()
 export class LocalRestApiFeatureBridgeService implements LocalRestApiFeatureBridge {
   private readonly _issueService = inject(IssueService);
   private readonly _taskService = inject(TaskService);
+  private readonly _taskMoveToProjectService = inject(TaskMoveToProjectService);
   private readonly _store = inject(Store);
 
   issueLink(
@@ -42,7 +45,16 @@ export class LocalRestApiFeatureBridgeService implements LocalRestApiFeatureBrid
     this._taskService.addTimeSpentAndSync(task, durationMs, date);
   }
 
+  async moveTaskToProject(taskId: string, projectId: string): Promise<void> {
+    const task = await firstValueFrom(this._taskService.getByIdWithSubTaskData$(taskId));
+    if (task) {
+      await this._taskMoveToProjectService.moveToProject(task, projectId, {
+        isSkipConfirm: true,
+      });
+    }
+  }
+
   isTaskOverdue(task: Task, todayStr: string, startOfNextDayDiffMs: number): boolean {
-    return isTaskOverdue(task, todayStr, startOfNextDayDiffMs);
+    return isTaskOverdueUtil(task, todayStr, startOfNextDayDiffMs);
   }
 }

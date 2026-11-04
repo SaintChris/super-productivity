@@ -1,12 +1,15 @@
 import { Injectable, inject } from '@angular/core';
+import { toSignal } from '@angular/core/rxjs-interop';
 import { Store } from '@ngrx/store';
 import { firstValueFrom } from 'rxjs';
+import typia from 'typia';
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { TaskService } from '../../features/tasks/task.service';
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { Task, TaskWithSubTasks } from '../../features/tasks/task.model';
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { TaskArchiveService } from '../../features/archive/task-archive.service';
+import { ArchiveOperationHandler } from '../../op-log/apply/archive-operation-handler.service';
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { ProjectService } from '../../features/project/project.service';
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
@@ -14,9 +17,17 @@ import { TagService } from '../../features/tag/tag.service';
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
 import { TODAY_TAG } from '../../features/tag/tag.const';
 import { DateService } from '../date/date.service';
+import { DataInitStateService } from '../data-init/data-init-state.service';
+import { isTodayWithOffset } from '../../util/is-today.util';
+import { isValidDBDateStr } from '../../util/get-db-date-str';
 import { IssueLog } from '../log';
 import { LOCAL_REST_API_FEATURE_BRIDGE } from './local-rest-api-feature-bridge';
 import { LOCAL_REST_API_FEATURE_ROUTES } from './local-rest-api-feature-routes';
+import { createErrorResponse, createSuccessResponse } from './local-rest-api-response';
+import {
+  MAX_TIME_SPENT_PER_DAY_MS,
+  parseTimeSpentBody,
+} from './local-rest-api-task-time';
 
 import { TaskSharedActions } from '../../root-store/meta/task-shared.actions';
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
@@ -37,30 +48,320 @@ import {
   LocalRestApiRequestPayload,
   LocalRestApiResponsePayload,
 } from '../../../../electron/shared-with-frontend/local-rest-api.model';
-import {
-  isRecord,
-  DeadlineChange,
-  resolveDeadlineChange,
-  validateDeadlineFields,
-  hasOwn,
-  DEADLINE_FIELDS,
-  WritableTaskFields,
-  pickAllowedFields,
-  validateWritableFields,
-  firstRejectedField,
-  SUBTASK_INHERITED_FIELDS,
-  getQueryParam,
-  getQueryParamAsBoolean,
-  createErrorResponse,
-  createSuccessResponse,
-  TaskSource,
-  isTaskInToday,
-  MAX_TIME_SPENT_PER_DAY_MS,
-  parseAddTimeSpentBody,
-  readIsIgnoreShortSyntax,
-  isIncluded,
-  ISSUE_URL_TIMEOUT_MS,
-} from './local-rest-api-handler.utils';
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** Only these fields may be set via the REST API to prevent state corruption. */
+const ALLOWED_TASK_FIELDS = new Set<string>([
+  'title',
+  'notes',
+  'isDone',
+  'timeEstimate',
+  'timeSpent',
+  'projectId',
+  'tagIds',
+  'dueDay',
+  'dueWithTime',
+  'plannedAt',
+  'deadlineDay',
+  'deadlineWithTime',
+  'deadlineRemindAt',
+]);
+
+/**
+ * Relational fields that callers often try to set but must be rejected:
+ * mutating them as plain values corrupts invariants (parent<->child links,
+ * projectId inheritance, tag-ordering lists). Subtask creation is available
+ * via `POST /tasks` with `parentId` — see `_handleCreateTask`.
+ */
+const REJECTED_TASK_FIELDS = ['parentId', 'subTaskIds'] as const;
+
+/**
+ * Fields a subtask inherits from its parent at the reducer (`addSubTask`
+ * forces `tagIds: []` and `projectId = parent.projectId`). Reject them on
+ * subtask create so callers don't get a 201 with values different from what
+ * they sent.
+ */
+const SUBTASK_INHERITED_FIELDS = ['projectId', 'tagIds'] as const;
+
+const pickAllowedFields = (body: Record<string, unknown>): Partial<Task> => {
+  const result: Record<string, unknown> = {};
+  for (const key of Object.keys(body)) {
+    if (ALLOWED_TASK_FIELDS.has(key)) {
+      result[key] = body[key];
+    }
+  }
+  return result as Partial<Task>;
+};
+
+/**
+ * Value-level types for the fields writable via the REST API. Keys mirror
+ * ALLOWED_TASK_FIELDS; `pickAllowedFields` filters by key only, so this is
+ * where the *values* get checked. Without it a caller could push a wrong-typed
+ * value (e.g. `tagIds: 123`, `timeEstimate: 'abc'`) straight into the store and
+ * the synced op-log, where it corrupts state locally and trips typia-as-corrupt
+ * on other devices when the op replays.
+ */
+interface WritableTaskFields {
+  title?: string;
+  notes?: string;
+  isDone?: boolean;
+  timeEstimate?: number;
+  timeSpent?: number;
+  projectId?: string;
+  tagIds?: string[];
+  dueDay?: string | null;
+  dueWithTime?: number | null;
+  plannedAt?: number;
+  deadlineDay?: string | null;
+  deadlineWithTime?: number | null;
+  deadlineRemindAt?: number | null;
+}
+
+type FieldTypeError = { path: string; expected: string };
+
+/**
+ * Validates the value types of already-key-filtered task fields. The create
+ * path is separately guarded by `typia.assert<Task>` in the task service (a
+ * bad value throws → generic 500); validating here lets both create and PATCH
+ * reject bad input with a clean 400 before anything is dispatched.
+ */
+const validateWritableFields = (
+  fields: Partial<Task>,
+): { ok: true } | { ok: false; errors: FieldTypeError[] } => {
+  const result = typia.validate<WritableTaskFields>(fields);
+  if (result.success) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    errors: result.errors.map((e) => ({ path: e.path, expected: e.expected })),
+  };
+};
+
+const DEADLINE_FIELDS = ['deadlineDay', 'deadlineWithTime', 'deadlineRemindAt'] as const;
+
+type DeadlineChange =
+  | {
+      type: 'set';
+      fields: {
+        deadlineDay?: string;
+        deadlineWithTime?: number;
+        deadlineRemindAt?: number;
+      };
+    }
+  | { type: 'clearReminder' }
+  | { type: 'remove' };
+
+const hasOwn = (value: object, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(value, key);
+
+const validateDeadlineFields = (
+  fields: Partial<WritableTaskFields>,
+): string | undefined => {
+  if (fields.deadlineDay != null && fields.deadlineWithTime != null) {
+    return 'deadlineDay and deadlineWithTime cannot both be set';
+  }
+  if (typeof fields.deadlineDay === 'string' && !isValidDBDateStr(fields.deadlineDay)) {
+    return 'deadlineDay must be a valid YYYY-MM-DD date';
+  }
+  if (fields.deadlineWithTime != null && fields.deadlineWithTime <= 0) {
+    return 'deadlineWithTime must be a positive timestamp';
+  }
+  if (fields.deadlineRemindAt != null && fields.deadlineRemindAt <= 0) {
+    return 'deadlineRemindAt must be a positive timestamp';
+  }
+  return undefined;
+};
+
+/**
+ * Resolves which deadline day/time the request results in, before reminders
+ * are considered. An omitted field carries the task's current value over; a
+ * newly supplied deadline type replaces the other type, matching the
+ * mutual-exclusivity behavior of the deadline meta-reducer.
+ */
+const resolveDeadlineValue = (
+  fields: Partial<WritableTaskFields>,
+  existingTask?: Task,
+): { deadlineDay?: string; deadlineWithTime?: number } => {
+  const hasDay = hasOwn(fields, 'deadlineDay');
+  const hasTime = hasOwn(fields, 'deadlineWithTime');
+  const requestedDay = fields.deadlineDay ?? undefined;
+  const requestedTime = fields.deadlineWithTime ?? undefined;
+  let deadlineDay = hasDay ? requestedDay : (existingTask?.deadlineDay ?? undefined);
+  let deadlineWithTime = hasTime
+    ? requestedTime
+    : (existingTask?.deadlineWithTime ?? undefined);
+  if (requestedDay !== undefined) deadlineWithTime = undefined;
+  if (requestedTime !== undefined) deadlineDay = undefined;
+  return { deadlineDay, deadlineWithTime };
+};
+
+/**
+ * Resolves what happens to the reminder once the resulting deadline is known.
+ * A supplied value wins; a changed deadline without one clears the old
+ * reminder, just like the UI's setDeadline action; an otherwise unchanged
+ * deadline keeps its reminder. An explicit null that would otherwise keep an
+ * existing reminder becomes 'clear' so only the reminder is touched, without
+ * re-planning the deadline.
+ *
+ * Takes the *normalized* existing reminder (see `resolveDeadlineChange`): a
+ * stored `null` means "no reminder", so it must neither be carried over into
+ * `setDeadline` nor turn a `{"deadlineRemindAt": null}` no-op into a
+ * `clearDeadlineReminder` op.
+ */
+const resolveReminderChange = (
+  fields: Partial<WritableTaskFields>,
+  existingDeadlineRemindAt: number | undefined,
+  isDeadlineValueChanged: boolean,
+): { type: 'clear' } | { type: 'value'; remindAt: number | undefined } => {
+  if (!hasOwn(fields, 'deadlineRemindAt')) {
+    return {
+      type: 'value',
+      remindAt: isDeadlineValueChanged ? undefined : existingDeadlineRemindAt,
+    };
+  }
+  const requested = fields.deadlineRemindAt ?? undefined;
+  if (
+    requested === undefined &&
+    !isDeadlineValueChanged &&
+    existingDeadlineRemindAt !== undefined
+  ) {
+    return { type: 'clear' };
+  }
+  return { type: 'value', remindAt: requested };
+};
+
+const resolveDeadlineChange = (
+  fields: Partial<WritableTaskFields>,
+  existingTask?: Task,
+): { ok: true; change?: DeadlineChange } | { ok: false; message: string } => {
+  const hasDay = hasOwn(fields, 'deadlineDay');
+  const hasTime = hasOwn(fields, 'deadlineWithTime');
+  const hasReminder = hasOwn(fields, 'deadlineRemindAt');
+  if (!hasDay && !hasTime && !hasReminder) {
+    return { ok: true };
+  }
+
+  const { deadlineDay, deadlineWithTime } = resolveDeadlineValue(fields, existingTask);
+
+  if (deadlineDay === undefined && deadlineWithTime === undefined) {
+    if (fields.deadlineRemindAt != null) {
+      return { ok: false, message: 'deadlineRemindAt requires a deadline' };
+    }
+    const hasExistingDeadline = Boolean(
+      existingTask?.deadlineDay ||
+      existingTask?.deadlineWithTime ||
+      existingTask?.deadlineRemindAt,
+    );
+    return {
+      ok: true,
+      change: hasExistingDeadline && (hasDay || hasTime) ? { type: 'remove' } : undefined,
+    };
+  }
+
+  const existingDeadlineDay = existingTask?.deadlineDay ?? undefined;
+  const existingDeadlineWithTime = existingTask?.deadlineWithTime ?? undefined;
+  const existingDeadlineRemindAt = existingTask?.deadlineRemindAt ?? undefined;
+  const isDeadlineValueChanged =
+    deadlineDay !== existingDeadlineDay || deadlineWithTime !== existingDeadlineWithTime;
+
+  const reminder = resolveReminderChange(
+    fields,
+    existingDeadlineRemindAt,
+    isDeadlineValueChanged,
+  );
+  if (reminder.type === 'clear') {
+    return { ok: true, change: { type: 'clearReminder' } };
+  }
+  const deadlineRemindAt = reminder.remindAt;
+
+  if (
+    existingTask &&
+    deadlineDay === existingDeadlineDay &&
+    deadlineWithTime === existingDeadlineWithTime &&
+    deadlineRemindAt === existingDeadlineRemindAt
+  ) {
+    return { ok: true };
+  }
+
+  return {
+    ok: true,
+    change: {
+      type: 'set',
+      fields: {
+        ...(deadlineDay !== undefined ? { deadlineDay } : {}),
+        ...(deadlineWithTime !== undefined ? { deadlineWithTime } : {}),
+        ...(deadlineRemindAt !== undefined ? { deadlineRemindAt } : {}),
+      },
+    },
+  };
+};
+
+const firstRejectedField = (body: Record<string, unknown>): string | undefined =>
+  REJECTED_TASK_FIELDS.find((field) => field in body);
+
+const getQueryParam = (
+  query: Record<string, string | string[]>,
+  key: string,
+): string | undefined => {
+  const value = query[key];
+  if (value === undefined) return undefined;
+  return Array.isArray(value) ? value[0] : value;
+};
+
+/** Fork default stores titles literally. `false` opts into short-syntax parsing. */
+const readIsIgnoreShortSyntax = (
+  body: Record<string, unknown>,
+): { ok: true; value: boolean } | { ok: false; message: string } => {
+  const value = body['isIgnoreShortSyntax'];
+  if (value === undefined) return { ok: true, value: true };
+  return typeof value === 'boolean'
+    ? { ok: true, value }
+    : { ok: false, message: 'isIgnoreShortSyntax must be a boolean' };
+};
+
+/** `?include=a,b` (or repeated `include=`) asks for optional response fields. */
+const isIncluded = (query: Record<string, string | string[]>, field: string): boolean => {
+  const value = query['include'];
+  const values = value === undefined ? [] : Array.isArray(value) ? value : [value];
+  return values.some((v) => v.split(',').some((part) => part.trim() === field));
+};
+
+const getQueryParamAsBoolean = (
+  query: Record<string, string | string[]>,
+  key: string,
+  defaultValue: boolean,
+): boolean => {
+  const value = getQueryParam(query, key);
+  if (value === undefined) return defaultValue;
+  return value.toLowerCase() === 'true';
+};
+
+type TaskSource = 'active' | 'archived' | 'all';
+
+/**
+ * Upper bound for building `issueUrl` on `GET /tasks/:id?include=issueUrl`. Some providers
+ * (e.g. plugin providers without a derivable link) fetch the issue over the
+ * network; the link is a convenience, so a slow or offline provider must not
+ * eat the renderer's whole request budget (`LOCAL_REST_API_TIMEOUT_MS`).
+ */
+const ISSUE_URL_TIMEOUT_MS = 3000;
+
+const isValidTimestamp = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && new Date(value).getTime() > 0;
+
+const isTaskInToday = (
+  task: Task,
+  todayStr: string,
+  startOfNextDayDiffMs: number,
+): boolean => {
+  if (isValidTimestamp(task.dueWithTime)) {
+    return isTodayWithOffset(task.dueWithTime, todayStr, startOfNextDayDiffMs);
+  }
+  return task.dueDay === todayStr;
+};
 
 @Injectable({
   providedIn: 'root',
@@ -68,6 +369,7 @@ import {
 export class LocalRestApiHandlerService {
   private readonly _taskService = inject(TaskService);
   private readonly _taskArchiveService = inject(TaskArchiveService);
+  private readonly _archiveOperationHandler = inject(ArchiveOperationHandler);
   private readonly _projectService = inject(ProjectService);
   private readonly _tagService = inject(TagService);
   private readonly _dateService = inject(DateService);
@@ -75,6 +377,13 @@ export class LocalRestApiHandlerService {
   private readonly _featureRoutes =
     inject(LOCAL_REST_API_FEATURE_ROUTES, { optional: true }) ?? [];
   private readonly _store = inject(Store);
+  // The main process only knows the renderer has booted, which happens before
+  // the data is loaded — answering then would serve an empty task list as if it
+  // were the user's data, and let a write land on top of half-hydrated state.
+  private readonly _isDataLoaded = toSignal(
+    inject(DataInitStateService).isAllDataLoadedInitially$,
+    { initialValue: false },
+  );
   private _isInitialized = false;
 
   private _dispatchDeadlineChange(taskId: string, change: DeadlineChange): void {
@@ -138,6 +447,15 @@ export class LocalRestApiHandlerService {
     const { method, path, requestId, body, query } = payload;
     const segments = path.split('/').filter(Boolean);
 
+    if (this._isDataLoaded() !== true) {
+      return createErrorResponse(
+        requestId,
+        503,
+        'APP_NOT_READY',
+        'App data is still loading',
+      );
+    }
+
     if (method === 'GET' && path === '/status') {
       return this._handleGetStatus(requestId);
     }
@@ -178,7 +496,6 @@ export class LocalRestApiHandlerService {
       return this._handleListTags(requestId, query);
     }
 
-    // Tag and project writes (POST, PATCH, DELETE) are feature-owned routes.
     for (const routes of this._featureRoutes) {
       const response = await routes.handle(payload);
       if (response) {
@@ -308,7 +625,14 @@ export class LocalRestApiHandlerService {
     } else if (source === 'all') {
       tasks = await this._taskService.getAllTasksEverywhere();
     } else {
-      tasks = await firstValueFrom(this._taskService.allTasks$);
+      // Archiving a project leaves its tasks in the store; the app hides them
+      // everywhere, so "active" does too.
+      const [allTasks, archivedProjects] = await Promise.all([
+        firstValueFrom(this._taskService.allTasks$),
+        firstValueFrom(this._projectService.archived$),
+      ]);
+      const archivedIds = new Set(archivedProjects.map((p) => p.id));
+      tasks = allTasks.filter((t) => !t.projectId || !archivedIds.has(t.projectId));
     }
 
     let filtered = tasks;
@@ -499,7 +823,14 @@ export class LocalRestApiHandlerService {
     if (segments.length === 2) {
       if (method === 'GET') {
         const task = await this._getTaskById(taskId);
-        if (!task) {
+        // `source=active` hides a task of an archived project, as the list does.
+        const isHidden =
+          !!task?.projectId &&
+          getQueryParam(query, 'source') === 'active' &&
+          (await firstValueFrom(this._projectService.archived$)).some(
+            (p) => p.id === task.projectId,
+          );
+        if (!task || isHidden) {
           return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
         }
         // Opt-in: some providers fetch the issue over the network to build
@@ -570,6 +901,12 @@ export class LocalRestApiHandlerService {
         if (!task) {
           return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
         }
+        // An echoed `isDone: true` (GET→PATCH round trip) would only stamp a
+        // new `doneOn`: it moves the completion date and turns a won't-do task
+        // into a completed one.
+        if (changes.isDone === true && task.isDone) {
+          delete (changes as Record<string, unknown>).isDone;
+        }
 
         const deadlineFields = Object.fromEntries(
           DEADLINE_FIELDS.filter((field) => hasOwn(changes, field)).map((field) => [
@@ -590,6 +927,7 @@ export class LocalRestApiHandlerService {
           delete changes[field];
         }
 
+        let isMoveOnly = false;
         if (hasOwn(changes, 'projectId')) {
           const targetProjectId = changes.projectId;
           if (typeof targetProjectId !== 'string' || !targetProjectId.trim()) {
@@ -627,10 +965,15 @@ export class LocalRestApiHandlerService {
                 'Destination project not found or archived',
               );
             }
+            // Move it like the UI does, so a recurring task's config and other
+            // instances follow (#10675). A combined update below keeps projectId,
+            // now unchanged, so its change set and short syntax stay as sent.
+            await this._featureBridge.moveTaskToProject(taskId, targetProjectId);
+            isMoveOnly = Object.keys(changes).length === 1;
           }
         }
 
-        if (Object.keys(changes).length > 0) {
+        if (!isMoveOnly && Object.keys(changes).length > 0) {
           // Short syntax only parses a title-only change set, so that is the
           // only shape the flag changes; everything else keeps going through
           // update() and whatever bookkeeping it does.
@@ -674,8 +1017,12 @@ export class LocalRestApiHandlerService {
       return createSuccessResponse(requestId, 200, { currentTaskId: taskId });
     }
 
-    if (segments.length === 3 && segments[2] === 'time' && method === 'POST') {
-      const parsed = parseAddTimeSpentBody(body, this._dateService.todayStr());
+    if (
+      segments.length === 3 &&
+      segments[2] === 'time' &&
+      (method === 'POST' || method === 'PUT')
+    ) {
+      const parsed = parseTimeSpentBody(body, this._dateService.todayStr(), method);
       if ('error' in parsed) {
         return createErrorResponse(requestId, 400, parsed.code, parsed.error);
       }
@@ -688,11 +1035,27 @@ export class LocalRestApiHandlerService {
         const msg = 'Task has subtasks and its time is their sum; log time on a subtask';
         return createErrorResponse(requestId, 400, 'INVALID_INPUT', msg);
       }
+      if (method === 'PUT') {
+        const { date, duration } = parsed;
+        const previous = task.timeSpentOnDay?.[date];
+        if (duration !== (previous ?? 0) || (duration === 0 && previous !== undefined)) {
+          const timeSpentOnDay = { ...task.timeSpentOnDay };
+          if (duration === 0) {
+            delete timeSpentOnDay[date];
+          } else {
+            timeSpentOnDay[date] = duration;
+          }
+          // Same path as the time dialog: flush tracked time, then update totals.
+          this._taskService.update(taskId, { timeSpentOnDay });
+        }
+        return createSuccessResponse(requestId, 200, await this._getTaskById(taskId));
+      }
       const dayTotal = (task.timeSpentOnDay?.[parsed.date] || 0) + parsed.duration;
       if (dayTotal > MAX_TIME_SPENT_PER_DAY_MS) {
         const msg = 'Time spent on one day cannot exceed 24h';
         return createErrorResponse(requestId, 400, 'INVALID_INPUT', msg);
       }
+
       this._featureBridge.addTimeSpentOnDay(task, parsed.duration, parsed.date);
       return createSuccessResponse(requestId, 200, await this._getTaskById(taskId));
     }
@@ -748,6 +1111,11 @@ export class LocalRestApiHandlerService {
     }
 
     this._taskService.restoreTask(archivedTask, subTasks);
+    // The dispatch adds the task to the store; removing it from the archive
+    // runs afterwards as a queued side effect. Wait for it, so a 200 means the
+    // task has left the archive, the same as archive's 200 means it has
+    // entered it (#9952).
+    await this._archiveOperationHandler.whenLocalOperationsSettled();
     const restoredTask = await this._getTaskById(taskId);
     return createSuccessResponse(requestId, 200, restoredTask);
   }
