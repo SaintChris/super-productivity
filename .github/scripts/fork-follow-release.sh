@@ -230,11 +230,17 @@ apply_branch() {
 }
 
 resolve_release() {
+  local body
   if [[ -n "${RELEASE_TAG:-}" ]]; then
     release=$RELEASE_TAG
   else
-    command -v gh >/dev/null 2>&1 || die "gh is not installed and RELEASE_TAG is unset"
-    release=$(gh release view -R "$UPSTREAM_SLUG" --json tagName --jq .tagName)
+    # gh in Actions will not start without GH_TOKEN, and the fork token
+    # cannot read another repository. The public releases API needs no token.
+    body=$(curl -fsSL --retry 3 --retry-delay 2 \
+      "https://api.github.com/repos/${UPSTREAM_SLUG}/releases/latest") \
+      || die "could not read the latest upstream release"
+    release=$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])') \
+      || die "latest upstream release has no tag_name"
   fi
   [[ "$release" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "release tag is not vX.Y.Z: $release"
 }
