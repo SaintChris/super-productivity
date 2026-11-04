@@ -2,6 +2,7 @@ import { TestBed } from '@angular/core/testing';
 import { MockStore, provideMockStore } from '@ngrx/store/testing';
 import { BehaviorSubject, of } from 'rxjs';
 import { LocalRestApiHandlerService } from './local-rest-api-handler.service';
+import { LocalRestApiTaskRoutesService } from '../../features/tasks/local-rest-api-task-routes.service';
 import { TaskService } from '../../features/tasks/task.service';
 import { TaskArchiveService } from '../../features/archive/task-archive.service';
 import { ProjectService } from '../../features/project/project.service';
@@ -11,7 +12,7 @@ import { IssueLog } from '../log';
 import {
   LOCAL_REST_API_FEATURE_BRIDGE,
   LocalRestApiFeatureBridge,
-} from './local-rest-api-feature-bridge';
+} from '../../features/tasks/local-rest-api-feature-bridge';
 import {
   LOCAL_REST_API_FEATURE_ROUTES,
   LocalRestApiFeatureRoutes,
@@ -255,6 +256,7 @@ describe('LocalRestApiHandlerService', () => {
     TestBed.configureTestingModule({
       providers: [
         LocalRestApiHandlerService,
+        LocalRestApiTaskRoutesService,
         { provide: TaskService, useValue: taskServiceMock },
         { provide: TaskArchiveService, useValue: taskArchiveServiceMock },
         { provide: ArchiveOperationHandler, useValue: archiveOperationHandlerMock },
@@ -271,6 +273,7 @@ describe('LocalRestApiHandlerService', () => {
       ],
     });
 
+    featureRoutes.unshift(TestBed.inject(LocalRestApiTaskRoutesService));
     service = TestBed.inject(LocalRestApiHandlerService);
     store = TestBed.inject(MockStore);
     dispatchSpy = spyOn(store, 'dispatch');

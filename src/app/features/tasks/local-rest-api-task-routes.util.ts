@@ -1,31 +1,13 @@
 import typia from 'typia';
-import { isTodayWithOffset } from '../../util/is-today.util';
+import { isRecord } from '../../core/electron/local-rest-api-body';
 import { isValidDBDateStr } from '../../util/get-db-date-str';
+import { isTodayWithOffset } from '../../util/is-today.util';
+import { Task } from './task.model';
 
 /**
- * Structural stand-ins for `Task` fields this file touches. Kept local
- * instead of importing `Task` from `features/tasks/task.model` because this
- * file lives under `core/`, and `core` must not import from `features`
- * (layer-boundary lint rule) — the service that DOES import `Task` passes
- * real `Task` values in here; structural typing accepts them without a
- * feature-layer import.
+ * Task rules for the Local REST API. They live with the tasks feature so
+ * core/ stays the router, the body parser, and the response helpers.
  */
-type PickableTaskFields = Record<string, unknown>;
-
-interface DueDatedTask {
-  dueWithTime?: number | null;
-  dueDay?: string | null;
-}
-
-/**
- * Pure REST-API-handler helpers (field allow-lists, value validation,
- * response shaping) split out of `LocalRestApiHandlerService` — see the repo
- * service size cap (`**\/*.service.ts` capped at 1200 lines). Nothing here
- * touches Angular DI or the store; it's all plain input→output logic.
- */
-
-export const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /** Only these fields may be set via the REST API to prevent state corruption. */
 export const ALLOWED_TASK_FIELDS = new Set<string>([
@@ -60,14 +42,14 @@ export const REJECTED_TASK_FIELDS = ['parentId', 'subTaskIds'] as const;
  */
 export const SUBTASK_INHERITED_FIELDS = ['projectId', 'tagIds'] as const;
 
-export const pickAllowedFields = (body: Record<string, unknown>): PickableTaskFields => {
+export const pickAllowedFields = (body: Record<string, unknown>): Partial<Task> => {
   const result: Record<string, unknown> = {};
   for (const key of Object.keys(body)) {
     if (ALLOWED_TASK_FIELDS.has(key)) {
       result[key] = body[key];
     }
   }
-  return result;
+  return result as Partial<Task>;
 };
 
 /**
@@ -103,7 +85,7 @@ export type FieldTypeError = { path: string; expected: string };
  * reject bad input with a clean 400 before anything is dispatched.
  */
 export const validateWritableFields = (
-  fields: PickableTaskFields,
+  fields: Partial<Task>,
 ): { ok: true } | { ok: false; errors: FieldTypeError[] } => {
   const result = typia.validate<WritableTaskFields>(fields);
   if (!result.success) {
@@ -133,54 +115,6 @@ export const validateWritableFields = (
 export const firstRejectedField = (body: Record<string, unknown>): string | undefined =>
   REJECTED_TASK_FIELDS.find((field) => field in body);
 
-/**
- * Only these fields may be set on a task-repeat-cfg via the REST API. Deliberately
- * excludes every recurrence-computation field (repeatCycle, weekday flags,
- * monthlyWeekOfMonth/monthlyWeekday/monthlyLastDay, startDate, repeatEvery) —
- * those are mutually interdependent (e.g. the monthly anchor fields are
- * mutually exclusive with each other) and feed date-calculation code the repo's
- * own AGENTS.md flags as high-risk to get wrong. This keeps the REST surface to
- * independent scalars only: renaming, pausing, notes, and estimate.
- */
-export const ALLOWED_TASK_REPEAT_CFG_FIELDS = new Set<string>([
-  'title',
-  'notes',
-  'isPaused',
-  'defaultEstimate',
-]);
-
-export interface WritableTaskRepeatCfgFields {
-  title?: string | null;
-  notes?: string;
-  isPaused?: boolean;
-  defaultEstimate?: number;
-}
-
-export const pickAllowedTaskRepeatCfgFields = (
-  body: Record<string, unknown>,
-): Partial<WritableTaskRepeatCfgFields> => {
-  const result: Record<string, unknown> = {};
-  for (const key of Object.keys(body)) {
-    if (ALLOWED_TASK_REPEAT_CFG_FIELDS.has(key)) {
-      result[key] = body[key];
-    }
-  }
-  return result as Partial<WritableTaskRepeatCfgFields>;
-};
-
-export const validateWritableTaskRepeatCfgFields = (
-  fields: Partial<WritableTaskRepeatCfgFields>,
-): { ok: true } | { ok: false; errors: FieldTypeError[] } => {
-  const result = typia.validate<WritableTaskRepeatCfgFields>(fields);
-  if (result.success) {
-    return { ok: true };
-  }
-  return {
-    ok: false,
-    errors: result.errors.map((e) => ({ path: e.path, expected: e.expected })),
-  };
-};
-
 export const getQueryParam = (
   query: Record<string, string | string[]>,
   key: string,
@@ -200,13 +134,12 @@ export const getQueryParamAsBoolean = (
   return value.toLowerCase() === 'true';
 };
 
-export { createErrorResponse, createSuccessResponse } from './local-rest-api-response';
-
 /**
  * Titles in POST/PATCH bodies are stored literally by default in this fork:
  * `#tag`, `+project`, `30m`, `@date` and URLs are not parsed out of them.
  * `isIgnoreShortSyntax: false` opts into short-syntax parsing. Returns an
- * error message for a non-boolean value.
+ * error message for a non-boolean value. A missing flag stays true; that
+ * default lives only here.
  */
 export const readIsIgnoreShortSyntax = (
   body: Record<string, unknown>,
@@ -242,7 +175,7 @@ export const isValidTimestamp = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && new Date(value).getTime() > 0;
 
 export const isTaskInToday = (
-  task: DueDatedTask,
+  task: Pick<Task, 'dueDay' | 'dueWithTime'>,
   todayStr: string,
   startOfNextDayDiffMs: number,
 ): boolean => {
@@ -251,18 +184,6 @@ export const isTaskInToday = (
   }
   return task.dueDay === todayStr;
 };
-
-/**
- * Structural stand-in for the deadline fields of `Task`. Same reason as
- * `DueDatedTask` above: this file lives under `core/` and must not import
- * from `features/`, so the caller passes a real `Task` and structural typing
- * accepts it.
- */
-export interface DeadlineTask {
-  deadlineDay?: string | null;
-  deadlineWithTime?: number | null;
-  deadlineRemindAt?: number | null;
-}
 
 export const DEADLINE_FIELDS = [
   'deadlineDay',
@@ -311,7 +232,7 @@ export const validateDeadlineFields = (
  */
 export const resolveDeadlineValue = (
   fields: Partial<WritableTaskFields>,
-  existingTask?: DeadlineTask,
+  existingTask?: Pick<Task, 'deadlineDay' | 'deadlineWithTime'>,
 ): { deadlineDay?: string; deadlineWithTime?: number } => {
   const hasDay = hasOwn(fields, 'deadlineDay');
   const hasTime = hasOwn(fields, 'deadlineWithTime');
@@ -363,7 +284,7 @@ export const resolveReminderChange = (
 
 export const resolveDeadlineChange = (
   fields: Partial<WritableTaskFields>,
-  existingTask?: DeadlineTask,
+  existingTask?: Pick<Task, 'deadlineDay' | 'deadlineWithTime' | 'deadlineRemindAt'>,
 ): { ok: true; change?: DeadlineChange } | { ok: false; message: string } => {
   const hasDay = hasOwn(fields, 'deadlineDay');
   const hasTime = hasOwn(fields, 'deadlineWithTime');

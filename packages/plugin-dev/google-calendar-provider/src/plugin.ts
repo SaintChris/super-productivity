@@ -254,6 +254,9 @@ const isDeclined = (event: GoogleCalendarEvent): boolean =>
  * (#8171). The local task is the source of truth, so the mirror is excluded from
  * all read paths (schedule/agenda and search-to-add).
  */
+/** The title every auto time-block event gets in Google Calendar. */
+const TIME_BLOCK_TITLE = 'Focus time';
+
 const isSpManagedEvent = (event: GoogleCalendarEvent): boolean =>
   typeof event.extendedProperties?.private?.spTaskId === 'string';
 
@@ -770,12 +773,16 @@ PluginAPI.registerIssueProvider({
       const cfg = migrateConfig(config);
       const calendarId = getTimeBlockCalendarId(cfg);
       const gcalEventId = taskIdToGcalEventId(taskId);
-      const summary = eventData.isDone ? `[DONE] ${eventData.title}` : eventData.title;
+      // Every time block reads "Focus time" with normal visibility, so people
+      // who can see the calendar see that label, never the task title. The task
+      // itself stays in Super Productivity. Sent on every patch too, so older
+      // blocks (titled or private) follow on the next sync.
       const body = {
         id: gcalEventId,
-        summary,
+        summary: TIME_BLOCK_TITLE,
         start: { dateTime: toUTCISO(eventData.dueWithTime) },
         end: { dateTime: toUTCISO(eventData.dueWithTime + eventData.durationMs) },
+        visibility: 'default',
         extendedProperties: { private: { spTaskId: taskId } },
       };
 
@@ -783,6 +790,7 @@ PluginAPI.registerIssueProvider({
         summary: body.summary,
         start: body.start,
         end: body.end,
+        visibility: body.visibility,
       };
       const patch = (): Promise<unknown> =>
         http.patch(eventUrl(calendarId, gcalEventId), patchBody);

@@ -1,0 +1,747 @@
+import { Injectable, inject } from '@angular/core';
+import { Store } from '@ngrx/store';
+import { firstValueFrom } from 'rxjs';
+import { TaskArchiveService } from '../archive/task-archive.service';
+import { ArchiveOperationHandler } from '../../op-log/apply/archive-operation-handler.service';
+import { DateService } from '../../core/date/date.service';
+import { isRecord } from '../../core/electron/local-rest-api-body';
+import { LOCAL_REST_API_FEATURE_BRIDGE } from './local-rest-api-feature-bridge';
+import { LocalRestApiFeatureRoutes } from '../../core/electron/local-rest-api-feature-routes';
+import {
+  createErrorResponse,
+  createSuccessResponse,
+} from '../../core/electron/local-rest-api-response';
+import { IssueLog } from '../../core/log';
+import { parseTimeSpentBody } from '../../core/electron/local-rest-api-task-time';
+import { ProjectService } from '../project/project.service';
+import { TODAY_TAG } from '../tag/tag.const';
+import { TaskSharedActions } from '../../root-store/meta/task-shared.actions';
+import {
+  LocalRestApiRequestPayload,
+  LocalRestApiResponsePayload,
+} from '../../../../electron/shared-with-frontend/local-rest-api.model';
+import {
+  DEADLINE_FIELDS,
+  DeadlineChange,
+  ISSUE_URL_TIMEOUT_MS,
+  MAX_TIME_SPENT_PER_DAY_MS,
+  SUBTASK_INHERITED_FIELDS,
+  TaskSource,
+  WritableTaskFields,
+  firstRejectedField,
+  getQueryParam,
+  getQueryParamAsBoolean,
+  hasOwn,
+  isIncluded,
+  isTaskInToday,
+  pickAllowedFields,
+  readIsIgnoreShortSyntax,
+  resolveDeadlineChange,
+  validateDeadlineFields,
+  validateWritableFields,
+} from './local-rest-api-task-routes.util';
+import { Task, TaskWithSubTasks } from './task.model';
+import { TaskService } from './task.service';
+import { getDeadlineAutoPlanFields } from './util/get-deadline-auto-plan-fields';
+
+/** Local REST API routes for `/status`, `/task-control`, and `/tasks`. */
+@Injectable()
+export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes {
+  private readonly _taskService = inject(TaskService);
+  private readonly _taskArchiveService = inject(TaskArchiveService);
+  private readonly _archiveOperationHandler = inject(ArchiveOperationHandler);
+  private readonly _projectService = inject(ProjectService);
+  private readonly _dateService = inject(DateService);
+  private readonly _featureBridge = inject(LOCAL_REST_API_FEATURE_BRIDGE);
+  private readonly _store = inject(Store);
+
+  async handle(
+    request: LocalRestApiRequestPayload,
+  ): Promise<LocalRestApiResponsePayload | undefined> {
+    const { method, path, requestId, body, query } = request;
+    const segments = path.split('/').filter(Boolean);
+
+    if (method === 'GET' && path === '/status') {
+      return this._handleGetStatus(requestId);
+    }
+
+    if (method === 'GET' && path === '/task-control/current') {
+      return this._handleGetCurrentTask(requestId);
+    }
+
+    if (method === 'POST' && path === '/task-control/stop') {
+      return this._handleStopTask(requestId);
+    }
+
+    if (method === 'POST' && path === '/task-control/current') {
+      return this._handleSetCurrentTask(requestId, body);
+    }
+
+    if (method === 'GET' && path === '/tasks') {
+      return this._handleListTasks(requestId, query);
+    }
+
+    if (method === 'POST' && path === '/tasks') {
+      return this._handleCreateTask(requestId, body);
+    }
+
+    if (segments[0] === 'tasks' && segments[1] && segments.length >= 2) {
+      return this._handleTaskRoutes(method, segments, requestId, body, query);
+    }
+
+    return undefined;
+  }
+
+  private _dispatchDeadlineChange(taskId: string, change: DeadlineChange): void {
+    if (change.type === 'clearReminder') {
+      this._store.dispatch(TaskSharedActions.clearDeadlineReminder({ taskId }));
+      return;
+    }
+
+    if (change.type === 'remove') {
+      this._store.dispatch(
+        TaskSharedActions.removeDeadline({ taskId, isSkipSnack: true }),
+      );
+      return;
+    }
+
+    this._store.dispatch(
+      TaskSharedActions.setDeadline({
+        taskId,
+        ...change.fields,
+        ...getDeadlineAutoPlanFields(
+          this._dateService,
+          change.fields.deadlineDay,
+          change.fields.deadlineWithTime,
+        ),
+        isSkipSnack: true,
+      }),
+    );
+  }
+
+  private async _handleGetStatus(
+    requestId: string,
+  ): Promise<LocalRestApiResponsePayload> {
+    const [currentTask, allTasks] = await Promise.all([
+      firstValueFrom(this._taskService.currentTask$),
+      firstValueFrom(this._taskService.allTasks$),
+    ]);
+
+    return createSuccessResponse(requestId, 200, {
+      currentTask,
+      currentTaskId: currentTask?.id ?? null,
+      taskCount: allTasks.length,
+    });
+  }
+
+  private async _handleGetCurrentTask(
+    requestId: string,
+  ): Promise<LocalRestApiResponsePayload> {
+    const currentTask = await firstValueFrom(this._taskService.currentTask$);
+    return createSuccessResponse(requestId, 200, currentTask);
+  }
+
+  private async _handleStopTask(requestId: string): Promise<LocalRestApiResponsePayload> {
+    this._taskService.setCurrentId(null);
+    return createSuccessResponse(requestId, 200, { currentTaskId: null });
+  }
+
+  private async _handleSetCurrentTask(
+    requestId: string,
+    body: unknown,
+  ): Promise<LocalRestApiResponsePayload> {
+    if (!isRecord(body)) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'Request body must be a JSON object with taskId',
+      );
+    }
+
+    const taskId = body.taskId;
+
+    if (taskId === null) {
+      this._taskService.setCurrentId(null);
+      return createSuccessResponse(requestId, 200, { currentTaskId: null });
+    }
+
+    if (typeof taskId !== 'string') {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'taskId must be a string or null',
+      );
+    }
+
+    const task = await this._getTaskById(taskId);
+    if (!task) {
+      return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
+    }
+
+    this._taskService.setCurrentId(taskId);
+    return createSuccessResponse(requestId, 200, { currentTaskId: taskId });
+  }
+
+  private async _handleListTasks(
+    requestId: string,
+    query: Record<string, string | string[]>,
+  ): Promise<LocalRestApiResponsePayload> {
+    const queryText = getQueryParam(query, 'query');
+    const projectId = getQueryParam(query, 'projectId');
+    const tagId = getQueryParam(query, 'tagId');
+    const overdue = getQueryParamAsBoolean(query, 'overdue', false);
+    const includeDone = getQueryParamAsBoolean(query, 'includeDone', false);
+    const VALID_SOURCES: TaskSource[] = ['active', 'archived', 'all'];
+    const rawSource = getQueryParam(query, 'source') || 'active';
+    const source: TaskSource = VALID_SOURCES.includes(rawSource as TaskSource)
+      ? (rawSource as TaskSource)
+      : 'active';
+
+    let tasks: Task[];
+
+    if (source === 'archived') {
+      const archive = await this._taskArchiveService.load();
+      tasks = archive.ids.map((id) => archive.entities[id]).filter((t): t is Task => !!t);
+    } else if (source === 'all') {
+      tasks = await this._taskService.getAllTasksEverywhere();
+    } else {
+      // Archiving a project leaves its tasks in the store; the app hides them
+      // everywhere, so "active" does too.
+      const [allTasks, archivedProjects] = await Promise.all([
+        firstValueFrom(this._taskService.allTasks$),
+        firstValueFrom(this._projectService.archived$),
+      ]);
+      const archivedIds = new Set(archivedProjects.map((p) => p.id));
+      tasks = allTasks.filter((t) => !t.projectId || !archivedIds.has(t.projectId));
+    }
+
+    let filtered = tasks;
+
+    if (queryText) {
+      const lowerQuery = queryText.toLowerCase();
+      filtered = filtered.filter((t) => t.title.toLowerCase().includes(lowerQuery));
+    }
+
+    if (projectId) {
+      filtered = filtered.filter((t) => t.projectId === projectId);
+    }
+
+    if (tagId === TODAY_TAG.id) {
+      const todayStr = this._dateService.todayStr();
+      const startOfNextDayDiffMs = this._dateService.getStartOfNextDayDiffMs();
+      filtered = filtered.filter((t) => isTaskInToday(t, todayStr, startOfNextDayDiffMs));
+    } else if (tagId) {
+      filtered = filtered.filter((t) => t.tagIds.includes(tagId));
+    }
+
+    if (overdue) {
+      const todayStr = this._dateService.todayStr();
+      const startOfNextDayDiffMs = this._dateService.getStartOfNextDayDiffMs();
+      filtered = filtered.filter((t) =>
+        this._featureBridge.isTaskOverdue(t, todayStr, startOfNextDayDiffMs),
+      );
+    }
+
+    if (!includeDone) {
+      filtered = filtered.filter((t) => !t.isDone);
+    }
+
+    return createSuccessResponse(requestId, 200, filtered);
+  }
+
+  private async _handleCreateTask(
+    requestId: string,
+    body: unknown,
+  ): Promise<LocalRestApiResponsePayload> {
+    if (!isRecord(body) || typeof body.title !== 'string' || !body.title.trim()) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'Task title must be a non-empty string',
+      );
+    }
+
+    if ('subTaskIds' in body) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'UNSUPPORTED_FIELD',
+        'subTaskIds cannot be set on task creation — create the parent first, then create each child with POST /tasks using parentId',
+      );
+    }
+
+    const shortSyntaxFlag = readIsIgnoreShortSyntax(body);
+    if (!shortSyntaxFlag.ok) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        shortSyntaxFlag.message,
+      );
+    }
+    const isIgnoreShortSyntax = shortSyntaxFlag.value;
+
+    const title = body.title.trim();
+    const additionalFields = pickAllowedFields(body);
+
+    const validation = validateWritableFields(additionalFields);
+    if (!validation.ok) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'One or more task fields have an invalid type',
+        validation.errors,
+      );
+    }
+
+    const deadlineValidationError = validateDeadlineFields(additionalFields);
+    if (deadlineValidationError) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        deadlineValidationError,
+      );
+    }
+
+    const deadlineFields = Object.fromEntries(
+      DEADLINE_FIELDS.filter((field) => hasOwn(additionalFields, field)).map((field) => [
+        field,
+        additionalFields[field],
+      ]),
+    ) as Partial<WritableTaskFields>;
+    const deadlineResolution = resolveDeadlineChange(deadlineFields);
+    if (!deadlineResolution.ok) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        deadlineResolution.message,
+      );
+    }
+    for (const field of DEADLINE_FIELDS) {
+      delete additionalFields[field];
+    }
+
+    if ('parentId' in body) {
+      if (typeof body.parentId !== 'string' || !body.parentId) {
+        return createErrorResponse(
+          requestId,
+          400,
+          'INVALID_INPUT',
+          'parentId must be a non-empty string',
+        );
+      }
+
+      const inherited = SUBTASK_INHERITED_FIELDS.find((field) => field in body);
+      if (inherited) {
+        return createErrorResponse(
+          requestId,
+          400,
+          'UNSUPPORTED_FIELD',
+          `${inherited} cannot be set when creating a subtask — it's inherited from the parent`,
+        );
+      }
+
+      const parent = await this._getTaskById(body.parentId);
+      if (!parent) {
+        return createErrorResponse(
+          requestId,
+          404,
+          'PARENT_NOT_FOUND',
+          `Parent task ${body.parentId} not found`,
+        );
+      }
+
+      if (parent.parentId) {
+        return createErrorResponse(
+          requestId,
+          400,
+          'INVALID_PARENT',
+          'Cannot nest subtasks: parent task is itself a subtask',
+        );
+      }
+
+      const subTaskId = isIgnoreShortSyntax
+        ? this._featureBridge.addLiteralSubTask(body.parentId, {
+            title,
+            ...additionalFields,
+          })
+        : this._taskService.addSubTaskTo(body.parentId, {
+            title,
+            ...additionalFields,
+          });
+      if (deadlineResolution.change?.type === 'set') {
+        this._dispatchDeadlineChange(subTaskId, deadlineResolution.change);
+      }
+      const createdSubTask = await this._getTaskById(subTaskId);
+      return createSuccessResponse(requestId, 201, createdSubTask);
+    }
+
+    const taskId = isIgnoreShortSyntax
+      ? this._taskService.add(title, false, additionalFields, false, true)
+      : this._taskService.add(title, false, additionalFields);
+    if (deadlineResolution.change?.type === 'set') {
+      this._dispatchDeadlineChange(taskId, deadlineResolution.change);
+    }
+    const createdTask = await this._getTaskById(taskId);
+
+    return createSuccessResponse(requestId, 201, createdTask);
+  }
+
+  private async _handleTaskRoutes(
+    method: string,
+    segments: string[],
+    requestId: string,
+    body: unknown,
+    query: Record<string, string | string[]>,
+  ): Promise<LocalRestApiResponsePayload> {
+    const taskId = segments[1];
+
+    if (segments.length === 2) {
+      if (method === 'GET') {
+        const task = await this._getTaskById(taskId);
+        // `source=active` hides a task of an archived project, as the list does.
+        const isHidden =
+          !!task?.projectId &&
+          getQueryParam(query, 'source') === 'active' &&
+          (await firstValueFrom(this._projectService.archived$)).some(
+            (p) => p.id === task.projectId,
+          );
+        if (!task || isHidden) {
+          return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
+        }
+        // Opt-in: some providers fetch the issue over the network to build
+        // the link, and most callers (e.g. frequent status polls) don't need it.
+        const issueUrl = isIncluded(query, 'issueUrl')
+          ? await this._getIssueUrl(task)
+          : undefined;
+        return createSuccessResponse(
+          requestId,
+          200,
+          issueUrl ? { ...task, issueUrl } : task,
+        );
+      }
+
+      if (method === 'PATCH') {
+        if (!isRecord(body)) {
+          return createErrorResponse(
+            requestId,
+            400,
+            'INVALID_INPUT',
+            'PATCH body must be a JSON object',
+          );
+        }
+
+        const patchShortSyntaxFlag = readIsIgnoreShortSyntax(body);
+        if (!patchShortSyntaxFlag.ok) {
+          return createErrorResponse(
+            requestId,
+            400,
+            'INVALID_INPUT',
+            patchShortSyntaxFlag.message,
+          );
+        }
+
+        const rejected = firstRejectedField(body);
+        if (rejected) {
+          return createErrorResponse(
+            requestId,
+            400,
+            'UNSUPPORTED_FIELD',
+            `${rejected} cannot be set via PATCH — re-parenting is not supported by this API`,
+          );
+        }
+
+        const changes = pickAllowedFields(body);
+        const validation = validateWritableFields(changes);
+        if (!validation.ok) {
+          return createErrorResponse(
+            requestId,
+            400,
+            'INVALID_INPUT',
+            'One or more task fields have an invalid type',
+            validation.errors,
+          );
+        }
+
+        const deadlineValidationError = validateDeadlineFields(changes);
+        if (deadlineValidationError) {
+          return createErrorResponse(
+            requestId,
+            400,
+            'INVALID_INPUT',
+            deadlineValidationError,
+          );
+        }
+
+        const task = await this._getTaskById(taskId);
+        if (!task) {
+          return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
+        }
+        // An echoed `isDone: true` (GET→PATCH round trip) would only stamp a
+        // new `doneOn`: it moves the completion date and turns a won't-do task
+        // into a completed one.
+        if (changes.isDone === true && task.isDone) {
+          delete (changes as Record<string, unknown>).isDone;
+        }
+
+        const deadlineFields = Object.fromEntries(
+          DEADLINE_FIELDS.filter((field) => hasOwn(changes, field)).map((field) => [
+            field,
+            changes[field],
+          ]),
+        ) as Partial<WritableTaskFields>;
+        const deadlineResolution = resolveDeadlineChange(deadlineFields, task);
+        if (!deadlineResolution.ok) {
+          return createErrorResponse(
+            requestId,
+            400,
+            'INVALID_INPUT',
+            deadlineResolution.message,
+          );
+        }
+        for (const field of DEADLINE_FIELDS) {
+          delete changes[field];
+        }
+
+        let isMoveOnly = false;
+        if (hasOwn(changes, 'projectId')) {
+          const targetProjectId = changes.projectId;
+          if (typeof targetProjectId !== 'string' || !targetProjectId.trim()) {
+            return createErrorResponse(
+              requestId,
+              400,
+              'INVALID_INPUT',
+              'projectId must be a non-empty string',
+            );
+          }
+          const isProjectChange = targetProjectId !== task.projectId;
+          // Echoing back the unchanged projectId is allowed on subtasks so
+          // GET→PATCH round-trips don't fail; only actual changes are rejected.
+          if (task.parentId && isProjectChange) {
+            return createErrorResponse(
+              requestId,
+              400,
+              'UNSUPPORTED_FIELD',
+              'projectId cannot be changed directly on a subtask — move its parent task instead',
+            );
+          }
+
+          if (isProjectChange) {
+            // list() only contains unarchived projects, and matching by iteration
+            // (not entity-map lookup) keeps prototype-property names like
+            // 'constructor' from resolving to a truthy non-project.
+            const targetProject = this._projectService
+              .list()
+              .find((project) => project.id === targetProjectId && !project.isArchived);
+            if (!targetProject) {
+              return createErrorResponse(
+                requestId,
+                404,
+                'PROJECT_NOT_FOUND',
+                'Destination project not found or archived',
+              );
+            }
+            // Move it like the UI does, so a recurring task's config and other
+            // instances follow (#10675). A combined update below keeps projectId,
+            // now unchanged, so its change set and short syntax stay as sent.
+            await this._featureBridge.moveTaskToProject(taskId, targetProjectId);
+            isMoveOnly = Object.keys(changes).length === 1;
+          }
+        }
+
+        if (!isMoveOnly && Object.keys(changes).length > 0) {
+          // Short syntax only parses a title-only change set, so that is the
+          // only shape the flag changes; everything else keeps going through
+          // update() and whatever bookkeeping it does.
+          const isTitleOnly =
+            Object.keys(changes).length === 1 && hasOwn(changes, 'title');
+          if (patchShortSyntaxFlag.value && isTitleOnly) {
+            this._store.dispatch(
+              TaskSharedActions.updateTask({
+                task: { id: taskId, changes },
+                isIgnoreShortSyntax: true,
+              }),
+            );
+          } else {
+            this._taskService.update(taskId, changes);
+          }
+        }
+        if (deadlineResolution.change) {
+          this._dispatchDeadlineChange(taskId, deadlineResolution.change);
+        }
+        return createSuccessResponse(requestId, 200, await this._getTaskById(taskId));
+      }
+
+      if (method === 'DELETE') {
+        const task = await this._getTaskWithSubTasksById(taskId);
+        if (!task) {
+          return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
+        }
+
+        this._taskService.remove(task);
+        return createSuccessResponse(requestId, 200, { deleted: true, id: taskId });
+      }
+    }
+
+    if (segments.length === 3 && segments[2] === 'start' && method === 'POST') {
+      const task = await this._getTaskById(taskId);
+      if (!task) {
+        return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
+      }
+
+      this._taskService.setCurrentId(taskId);
+      return createSuccessResponse(requestId, 200, { currentTaskId: taskId });
+    }
+
+    if (
+      segments.length === 3 &&
+      segments[2] === 'time' &&
+      (method === 'POST' || method === 'PUT')
+    ) {
+      const parsed = parseTimeSpentBody(body, this._dateService.todayStr(), method);
+      if ('error' in parsed) {
+        return createErrorResponse(requestId, 400, parsed.code, parsed.error);
+      }
+      const task = await this._getTaskById(taskId);
+      if (!task) {
+        return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
+      }
+      // A parent's time is recomputed from its subtasks, so time logged on it is lost.
+      if (task.subTaskIds?.length) {
+        const msg = 'Task has subtasks and its time is their sum; log time on a subtask';
+        return createErrorResponse(requestId, 400, 'INVALID_INPUT', msg);
+      }
+      if (method === 'PUT') {
+        const { date, duration } = parsed;
+        const previous = task.timeSpentOnDay?.[date];
+        if (duration !== (previous ?? 0) || (duration === 0 && previous !== undefined)) {
+          const timeSpentOnDay = { ...task.timeSpentOnDay };
+          if (duration === 0) {
+            delete timeSpentOnDay[date];
+          } else {
+            timeSpentOnDay[date] = duration;
+          }
+          // Same path as the time dialog: flush tracked time, then update totals.
+          this._taskService.update(taskId, { timeSpentOnDay });
+        }
+        return createSuccessResponse(requestId, 200, await this._getTaskById(taskId));
+      }
+      const dayTotal = (task.timeSpentOnDay?.[parsed.date] || 0) + parsed.duration;
+      if (dayTotal > MAX_TIME_SPENT_PER_DAY_MS) {
+        const msg = 'Time spent on one day cannot exceed 24h';
+        return createErrorResponse(requestId, 400, 'INVALID_INPUT', msg);
+      }
+
+      this._featureBridge.addTimeSpentOnDay(task, parsed.duration, parsed.date);
+      return createSuccessResponse(requestId, 200, await this._getTaskById(taskId));
+    }
+
+    if (segments.length === 3 && segments[2] === 'archive' && method === 'POST') {
+      return this._handleArchiveTask(requestId, taskId);
+    }
+
+    if (segments.length === 3 && segments[2] === 'restore' && method === 'POST') {
+      return this._handleRestoreTask(requestId, taskId);
+    }
+
+    return createErrorResponse(requestId, 404, 'NOT_FOUND', 'Route not found');
+  }
+
+  private async _handleArchiveTask(
+    requestId: string,
+    taskId: string,
+  ): Promise<LocalRestApiResponsePayload> {
+    const task = await this._getTaskWithSubTasksById(taskId);
+    if (!task) {
+      return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
+    }
+
+    await this._taskService.moveToArchive(task);
+    return createSuccessResponse(requestId, 200, { id: taskId, archived: true });
+  }
+
+  private async _handleRestoreTask(
+    requestId: string,
+    taskId: string,
+  ): Promise<LocalRestApiResponsePayload> {
+    const existsInArchive = await this._taskArchiveService.hasTask(taskId);
+    if (!existsInArchive) {
+      return createErrorResponse(
+        requestId,
+        404,
+        'TASK_NOT_FOUND',
+        'Task not found in archive',
+      );
+    }
+
+    const archivedTask = await this._taskArchiveService.getById(taskId);
+    const subTasks: Task[] = [];
+
+    if (archivedTask.subTaskIds?.length) {
+      const archive = await this._taskArchiveService.load();
+      for (const subTaskId of archivedTask.subTaskIds) {
+        if (archive.entities[subTaskId]) {
+          subTasks.push(archive.entities[subTaskId]);
+        }
+      }
+    }
+
+    this._taskService.restoreTask(archivedTask, subTasks);
+    // The dispatch adds the task to the store; removing it from the archive
+    // runs afterwards as a queued side effect. Wait for it, so a 200 means the
+    // task has left the archive, the same as archive's 200 means it has
+    // entered it (#9952).
+    await this._archiveOperationHandler.whenLocalOperationsSettled();
+    const restoredTask = await this._getTaskById(taskId);
+    return createSuccessResponse(requestId, 200, restoredTask);
+  }
+
+  /**
+   * Best-effort link to the task's issue for `GET /tasks/:id`. Returns
+   * undefined when the task has no issue, the provider can't build a link, or
+   * building it fails or times out — never turns the request into an error.
+   */
+  private async _getIssueUrl(task: Task): Promise<string | undefined> {
+    const { issueType, issueId, issueProviderId } = task;
+    if (!issueType || !issueId || !issueProviderId) {
+      return undefined;
+    }
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const url = await Promise.race([
+        this._featureBridge.issueLink(issueType, issueId, issueProviderId),
+        new Promise<undefined>((resolve) => {
+          timeoutId = setTimeout(() => resolve(undefined), ISSUE_URL_TIMEOUT_MS);
+        }),
+      ]);
+      return typeof url === 'string' && url ? url : undefined;
+    } catch {
+      IssueLog.warn('[LocalRestApi] issueUrl omitted: link lookup failed', {
+        id: task.id,
+      });
+      return undefined;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  // The id equality checks reject prototype-property names ('constructor',
+  // 'toString', …) that entity-map lookups resolve to truthy non-tasks.
+  private async _getTaskById(taskId: string): Promise<Task | undefined> {
+    const task = await firstValueFrom(this._taskService.getByIdOnce$(taskId));
+    return task?.id === taskId ? task : undefined;
+  }
+
+  private async _getTaskWithSubTasksById(
+    taskId: string,
+  ): Promise<TaskWithSubTasks | undefined> {
+    const task = await firstValueFrom(this._taskService.getByIdWithSubTaskData$(taskId));
+    return task?.id === taskId ? task : undefined;
+  }
+}

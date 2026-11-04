@@ -1,7 +1,7 @@
 import {
   parseAddTimeSpentBody,
   readIsIgnoreShortSyntax,
-} from './local-rest-api-handler.utils';
+} from './local-rest-api-task-routes.util';
 
 describe('parseAddTimeSpentBody', () => {
   const TODAY = '2026-09-30';

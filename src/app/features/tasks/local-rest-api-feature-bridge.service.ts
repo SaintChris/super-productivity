@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import { Store } from '@ngrx/store';
 import { firstValueFrom } from 'rxjs';
-import { LocalRestApiFeatureBridge } from '../../core/electron/local-rest-api-feature-bridge';
+import { LocalRestApiFeatureBridge } from './local-rest-api-feature-bridge';
 import { TaskLog } from '../../core/log';
 import { IssueService } from '../issue/issue.service';
 import { IssueProviderKey } from '../issue/issue.model';
