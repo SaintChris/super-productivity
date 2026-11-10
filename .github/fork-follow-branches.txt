@@ -17,9 +17,9 @@
 # - The Wayland idle helper is a pinned binary the night build copies in.
 #   It is not a git branch. The source is already upstream.
 
-# port/rest-api-v19.2 conflicts with v19.3.1 (issue 14). This port keeps the
-# fork additions on upstream's API.
-port/rest-api-v19.3
+# port/rest-api-v19.3 conflicts with v20.0.0 (issue 16): v20 moved the task
+# routes out of core. This port keeps the fork additions on upstream's API.
+port/rest-api-v20
 feat/rest-api-port
 feat/gcal-private-time-blocks
 feat/start-minimized
