@@ -594,10 +594,13 @@ describe('LocalRestApiTaskRoutesService', () => {
           }),
         );
 
-        expect(taskServiceMock.add).toHaveBeenCalledWith('New Task', false, {
-          title: 'New Task',
-          dueWithTime: plannedAt,
-        });
+        expect(taskServiceMock.add).toHaveBeenCalledWith(
+          'New Task',
+          false,
+          { title: 'New Task', dueWithTime: plannedAt },
+          false,
+          true,
+        );
       });
 
       it('should let dueWithTime override plannedAt when creating a task', async () => {
@@ -611,10 +614,13 @@ describe('LocalRestApiTaskRoutesService', () => {
           }),
         );
 
-        expect(taskServiceMock.add).toHaveBeenCalledWith('New Task', false, {
-          title: 'New Task',
-          dueWithTime: 2,
-        });
+        expect(taskServiceMock.add).toHaveBeenCalledWith(
+          'New Task',
+          false,
+          { title: 'New Task', dueWithTime: 2 },
+          false,
+          true,
+        );
       });
 
       it('should report invalid plannedAt input on create', async () => {
