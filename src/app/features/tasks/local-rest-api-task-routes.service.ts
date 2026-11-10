@@ -1,50 +1,354 @@
 import { Injectable, inject } from '@angular/core';
 import { Store } from '@ngrx/store';
 import { firstValueFrom } from 'rxjs';
+import typia from 'typia';
+import { TaskService } from './task.service';
+import { Task, TaskWithSubTasks } from './task.model';
 import { TaskArchiveService } from '../archive/task-archive.service';
 import { ArchiveOperationHandler } from '../../op-log/apply/archive-operation-handler.service';
+import { ProjectService } from '../project/project.service';
+import { TODAY_TAG } from '../tag/tag.const';
 import { DateService } from '../../core/date/date.service';
-import { isRecord } from '../../core/electron/local-rest-api-body';
-import { LOCAL_REST_API_FEATURE_BRIDGE } from './local-rest-api-feature-bridge';
+import { isTodayWithOffset } from '../../util/is-today.util';
+import { isValidDBDateStr } from '../../util/get-db-date-str';
+import { IssueLog } from '../../core/log';
+import { LocalRestApiFeatureBridgeService } from './local-rest-api-feature-bridge.service';
+import { TrackingPresenceService } from '../tracking-presence/tracking-presence.service';
 import { LocalRestApiFeatureRoutes } from '../../core/electron/local-rest-api-feature-routes';
 import {
   createErrorResponse,
   createSuccessResponse,
 } from '../../core/electron/local-rest-api-response';
-import { IssueLog } from '../../core/log';
-import { parseTimeSpentBody } from '../../core/electron/local-rest-api-task-time';
-import { ProjectService } from '../project/project.service';
-import { TODAY_TAG } from '../tag/tag.const';
+import {
+  MAX_TIME_SPENT_PER_DAY_MS,
+  parseTimeSpentBody,
+} from './local-rest-api-task-time';
+import { mapLegacyPlannedAt } from './local-rest-api-legacy-fields';
+
 import { TaskSharedActions } from '../../root-store/meta/task-shared.actions';
+import { getDeadlineAutoPlanFields } from './util/get-deadline-auto-plan-fields';
 import {
   LocalRestApiRequestPayload,
   LocalRestApiResponsePayload,
 } from '../../../../electron/shared-with-frontend/local-rest-api.model';
-import {
-  DEADLINE_FIELDS,
-  DeadlineChange,
-  ISSUE_URL_TIMEOUT_MS,
-  MAX_TIME_SPENT_PER_DAY_MS,
-  SUBTASK_INHERITED_FIELDS,
-  TaskSource,
-  WritableTaskFields,
-  firstRejectedField,
-  getQueryParam,
-  getQueryParamAsBoolean,
-  hasOwn,
-  isIncluded,
-  isTaskInToday,
-  pickAllowedFields,
-  readIsIgnoreShortSyntax,
-  resolveDeadlineChange,
-  validateDeadlineFields,
-  validateWritableFields,
-} from './local-rest-api-task-routes.util';
-import { Task, TaskWithSubTasks } from './task.model';
-import { TaskService } from './task.service';
-import { getDeadlineAutoPlanFields } from './util/get-deadline-auto-plan-fields';
 
-/** Local REST API routes for `/status`, `/task-control`, and `/tasks`. */
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** Only these fields may be set via the REST API to prevent state corruption. */
+const ALLOWED_TASK_FIELDS = new Set<string>([
+  'title',
+  'notes',
+  'isDone',
+  'timeEstimate',
+  'timeSpent',
+  'projectId',
+  'tagIds',
+  'dueDay',
+  'dueWithTime',
+  'plannedAt',
+  'deadlineDay',
+  'deadlineWithTime',
+  'deadlineRemindAt',
+]);
+
+/**
+ * Relational fields that callers often try to set but must be rejected:
+ * mutating them as plain values corrupts invariants (parent<->child links,
+ * projectId inheritance, tag-ordering lists). Subtask creation is available
+ * via `POST /tasks` with `parentId` — see `_handleCreateTask`.
+ */
+const REJECTED_TASK_FIELDS = ['parentId', 'subTaskIds'] as const;
+
+/**
+ * Fields a subtask inherits from its parent at the reducer (`addSubTask`
+ * forces `tagIds: []` and `projectId = parent.projectId`). Reject them on
+ * subtask create so callers don't get a 201 with values different from what
+ * they sent.
+ */
+const SUBTASK_INHERITED_FIELDS = ['projectId', 'tagIds'] as const;
+
+const pickAllowedFields = (
+  body: Record<string, unknown>,
+): Partial<WritableTaskFields> => {
+  const result: Record<string, unknown> = {};
+  for (const key of Object.keys(body)) {
+    if (ALLOWED_TASK_FIELDS.has(key)) {
+      result[key] = body[key];
+    }
+  }
+  return result as Partial<WritableTaskFields>;
+};
+
+/**
+ * Value-level types for the fields writable via the REST API. Keys mirror
+ * ALLOWED_TASK_FIELDS; `pickAllowedFields` filters by key only, so this is
+ * where the *values* get checked. Without it a caller could push a wrong-typed
+ * value (e.g. `tagIds: 123`, `timeEstimate: 'abc'`) straight into the store and
+ * the synced op-log, where it corrupts state locally and trips typia-as-corrupt
+ * on other devices when the op replays.
+ */
+interface WritableTaskFields {
+  title?: string;
+  notes?: string;
+  isDone?: boolean;
+  timeEstimate?: number;
+  timeSpent?: number;
+  projectId?: string;
+  tagIds?: string[];
+  dueDay?: string | null;
+  dueWithTime?: number | null;
+  plannedAt?: number | null;
+  deadlineDay?: string | null;
+  deadlineWithTime?: number | null;
+  deadlineRemindAt?: number | null;
+}
+
+type FieldTypeError = { path: string; expected: string };
+
+/**
+ * Validates the value types of already-key-filtered task fields. The create
+ * path is separately guarded by `typia.assert<Task>` in the task service (a
+ * bad value throws → generic 500); validating here lets both create and PATCH
+ * reject bad input with a clean 400 before anything is dispatched.
+ */
+const validateWritableFields = (
+  fields: Partial<WritableTaskFields>,
+): { ok: true } | { ok: false; errors: FieldTypeError[] } => {
+  const result = typia.validate<WritableTaskFields>(fields);
+  if (result.success) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    errors: result.errors.map((e) => ({ path: e.path, expected: e.expected })),
+  };
+};
+
+const DEADLINE_FIELDS = ['deadlineDay', 'deadlineWithTime', 'deadlineRemindAt'] as const;
+
+type DeadlineChange =
+  | {
+      type: 'set';
+      fields: {
+        deadlineDay?: string;
+        deadlineWithTime?: number;
+        deadlineRemindAt?: number;
+      };
+    }
+  | { type: 'clearReminder' }
+  | { type: 'remove' };
+
+const hasOwn = (value: object, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(value, key);
+
+const validateDeadlineFields = (
+  fields: Partial<WritableTaskFields>,
+): string | undefined => {
+  if (fields.deadlineDay != null && fields.deadlineWithTime != null) {
+    return 'deadlineDay and deadlineWithTime cannot both be set';
+  }
+  if (typeof fields.deadlineDay === 'string' && !isValidDBDateStr(fields.deadlineDay)) {
+    return 'deadlineDay must be a valid YYYY-MM-DD date';
+  }
+  if (fields.deadlineWithTime != null && fields.deadlineWithTime <= 0) {
+    return 'deadlineWithTime must be a positive timestamp';
+  }
+  if (fields.deadlineRemindAt != null && fields.deadlineRemindAt <= 0) {
+    return 'deadlineRemindAt must be a positive timestamp';
+  }
+  return undefined;
+};
+
+/**
+ * Resolves which deadline day/time the request results in, before reminders
+ * are considered. An omitted field carries the task's current value over; a
+ * newly supplied deadline type replaces the other type, matching the
+ * mutual-exclusivity behavior of the deadline meta-reducer.
+ */
+const resolveDeadlineValue = (
+  fields: Partial<WritableTaskFields>,
+  existingTask?: Task,
+): { deadlineDay?: string; deadlineWithTime?: number } => {
+  const hasDay = hasOwn(fields, 'deadlineDay');
+  const hasTime = hasOwn(fields, 'deadlineWithTime');
+  const requestedDay = fields.deadlineDay ?? undefined;
+  const requestedTime = fields.deadlineWithTime ?? undefined;
+  let deadlineDay = hasDay ? requestedDay : (existingTask?.deadlineDay ?? undefined);
+  let deadlineWithTime = hasTime
+    ? requestedTime
+    : (existingTask?.deadlineWithTime ?? undefined);
+  if (requestedDay !== undefined) deadlineWithTime = undefined;
+  if (requestedTime !== undefined) deadlineDay = undefined;
+  return { deadlineDay, deadlineWithTime };
+};
+
+/**
+ * Resolves what happens to the reminder once the resulting deadline is known.
+ * A supplied value wins; a changed deadline without one clears the old
+ * reminder, just like the UI's setDeadline action; an otherwise unchanged
+ * deadline keeps its reminder. An explicit null that would otherwise keep an
+ * existing reminder becomes 'clear' so only the reminder is touched, without
+ * re-planning the deadline.
+ *
+ * Takes the *normalized* existing reminder (see `resolveDeadlineChange`): a
+ * stored `null` means "no reminder", so it must neither be carried over into
+ * `setDeadline` nor turn a `{"deadlineRemindAt": null}` no-op into a
+ * `clearDeadlineReminder` op.
+ */
+const resolveReminderChange = (
+  fields: Partial<WritableTaskFields>,
+  existingDeadlineRemindAt: number | undefined,
+  isDeadlineValueChanged: boolean,
+): { type: 'clear' } | { type: 'value'; remindAt: number | undefined } => {
+  if (!hasOwn(fields, 'deadlineRemindAt')) {
+    return {
+      type: 'value',
+      remindAt: isDeadlineValueChanged ? undefined : existingDeadlineRemindAt,
+    };
+  }
+  const requested = fields.deadlineRemindAt ?? undefined;
+  if (
+    requested === undefined &&
+    !isDeadlineValueChanged &&
+    existingDeadlineRemindAt !== undefined
+  ) {
+    return { type: 'clear' };
+  }
+  return { type: 'value', remindAt: requested };
+};
+
+const resolveDeadlineChange = (
+  fields: Partial<WritableTaskFields>,
+  existingTask?: Task,
+): { ok: true; change?: DeadlineChange } | { ok: false; message: string } => {
+  const hasDay = hasOwn(fields, 'deadlineDay');
+  const hasTime = hasOwn(fields, 'deadlineWithTime');
+  const hasReminder = hasOwn(fields, 'deadlineRemindAt');
+  if (!hasDay && !hasTime && !hasReminder) {
+    return { ok: true };
+  }
+
+  const { deadlineDay, deadlineWithTime } = resolveDeadlineValue(fields, existingTask);
+
+  if (deadlineDay === undefined && deadlineWithTime === undefined) {
+    if (fields.deadlineRemindAt != null) {
+      return { ok: false, message: 'deadlineRemindAt requires a deadline' };
+    }
+    const hasExistingDeadline = Boolean(
+      existingTask?.deadlineDay ||
+      existingTask?.deadlineWithTime ||
+      existingTask?.deadlineRemindAt,
+    );
+    return {
+      ok: true,
+      change: hasExistingDeadline && (hasDay || hasTime) ? { type: 'remove' } : undefined,
+    };
+  }
+
+  const existingDeadlineDay = existingTask?.deadlineDay ?? undefined;
+  const existingDeadlineWithTime = existingTask?.deadlineWithTime ?? undefined;
+  const existingDeadlineRemindAt = existingTask?.deadlineRemindAt ?? undefined;
+  const isDeadlineValueChanged =
+    deadlineDay !== existingDeadlineDay || deadlineWithTime !== existingDeadlineWithTime;
+
+  const reminder = resolveReminderChange(
+    fields,
+    existingDeadlineRemindAt,
+    isDeadlineValueChanged,
+  );
+  if (reminder.type === 'clear') {
+    return { ok: true, change: { type: 'clearReminder' } };
+  }
+  const deadlineRemindAt = reminder.remindAt;
+
+  if (
+    existingTask &&
+    deadlineDay === existingDeadlineDay &&
+    deadlineWithTime === existingDeadlineWithTime &&
+    deadlineRemindAt === existingDeadlineRemindAt
+  ) {
+    return { ok: true };
+  }
+
+  return {
+    ok: true,
+    change: {
+      type: 'set',
+      fields: {
+        ...(deadlineDay !== undefined ? { deadlineDay } : {}),
+        ...(deadlineWithTime !== undefined ? { deadlineWithTime } : {}),
+        ...(deadlineRemindAt !== undefined ? { deadlineRemindAt } : {}),
+      },
+    },
+  };
+};
+
+const firstRejectedField = (body: Record<string, unknown>): string | undefined =>
+  REJECTED_TASK_FIELDS.find((field) => field in body);
+
+const getQueryParam = (
+  query: Record<string, string | string[]>,
+  key: string,
+): string | undefined => {
+  const value = query[key];
+  if (value === undefined) return undefined;
+  return Array.isArray(value) ? value[0] : value;
+};
+
+/** Fork default stores titles literally. `false` opts into short-syntax parsing. */
+const readIsIgnoreShortSyntax = (
+  body: Record<string, unknown>,
+): { ok: true; value: boolean } | { ok: false; message: string } => {
+  const value = body['isIgnoreShortSyntax'];
+  if (value === undefined) return { ok: true, value: true };
+  return typeof value === 'boolean'
+    ? { ok: true, value }
+    : { ok: false, message: 'isIgnoreShortSyntax must be a boolean' };
+};
+
+/** `?include=a,b` (or repeated `include=`) asks for optional response fields. */
+const isIncluded = (query: Record<string, string | string[]>, field: string): boolean => {
+  const value = query['include'];
+  const values = value === undefined ? [] : Array.isArray(value) ? value : [value];
+  return values.some((v) => v.split(',').some((part) => part.trim() === field));
+};
+
+const getQueryParamAsBoolean = (
+  query: Record<string, string | string[]>,
+  key: string,
+  defaultValue: boolean,
+): boolean => {
+  const value = getQueryParam(query, key);
+  if (value === undefined) return defaultValue;
+  return value.toLowerCase() === 'true';
+};
+
+type TaskSource = 'active' | 'archived' | 'all';
+
+/**
+ * Upper bound for building `issueUrl` on `GET /tasks/:id?include=issueUrl`. Some providers
+ * (e.g. plugin providers without a derivable link) fetch the issue over the
+ * network; the link is a convenience, so a slow or offline provider must not
+ * eat the renderer's whole request budget (`LOCAL_REST_API_TIMEOUT_MS`).
+ */
+const ISSUE_URL_TIMEOUT_MS = 3000;
+
+const isValidTimestamp = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && new Date(value).getTime() > 0;
+
+const isTaskInToday = (
+  task: Task,
+  todayStr: string,
+  startOfNextDayDiffMs: number,
+): boolean => {
+  if (isValidTimestamp(task.dueWithTime)) {
+    return isTodayWithOffset(task.dueWithTime, todayStr, startOfNextDayDiffMs);
+  }
+  return task.dueDay === todayStr;
+};
+
+/** Local REST API routes under `/status`, `/task-control` and `/tasks`. */
 @Injectable()
 export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes {
   private readonly _taskService = inject(TaskService);
@@ -52,13 +356,41 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
   private readonly _archiveOperationHandler = inject(ArchiveOperationHandler);
   private readonly _projectService = inject(ProjectService);
   private readonly _dateService = inject(DateService);
-  private readonly _featureBridge = inject(LOCAL_REST_API_FEATURE_BRIDGE);
+  private readonly _featureBridge = inject(LocalRestApiFeatureBridgeService);
   private readonly _store = inject(Store);
+  private readonly _trackingPresence = inject(TrackingPresenceService);
+
+  private _dispatchDeadlineChange(taskId: string, change: DeadlineChange): void {
+    if (change.type === 'clearReminder') {
+      this._store.dispatch(TaskSharedActions.clearDeadlineReminder({ taskId }));
+      return;
+    }
+
+    if (change.type === 'remove') {
+      this._store.dispatch(
+        TaskSharedActions.removeDeadline({ taskId, isSkipSnack: true }),
+      );
+      return;
+    }
+
+    this._store.dispatch(
+      TaskSharedActions.setDeadline({
+        taskId,
+        ...change.fields,
+        ...getDeadlineAutoPlanFields(
+          this._dateService,
+          change.fields.deadlineDay,
+          change.fields.deadlineWithTime,
+        ),
+        isSkipSnack: true,
+      }),
+    );
+  }
 
   async handle(
-    request: LocalRestApiRequestPayload,
+    payload: LocalRestApiRequestPayload,
   ): Promise<LocalRestApiResponsePayload | undefined> {
-    const { method, path, requestId, body, query } = request;
+    const { method, path, requestId, body, query } = payload;
     const segments = path.split('/').filter(Boolean);
 
     if (method === 'GET' && path === '/status') {
@@ -92,33 +424,6 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
     return undefined;
   }
 
-  private _dispatchDeadlineChange(taskId: string, change: DeadlineChange): void {
-    if (change.type === 'clearReminder') {
-      this._store.dispatch(TaskSharedActions.clearDeadlineReminder({ taskId }));
-      return;
-    }
-
-    if (change.type === 'remove') {
-      this._store.dispatch(
-        TaskSharedActions.removeDeadline({ taskId, isSkipSnack: true }),
-      );
-      return;
-    }
-
-    this._store.dispatch(
-      TaskSharedActions.setDeadline({
-        taskId,
-        ...change.fields,
-        ...getDeadlineAutoPlanFields(
-          this._dateService,
-          change.fields.deadlineDay,
-          change.fields.deadlineWithTime,
-        ),
-        isSkipSnack: true,
-      }),
-    );
-  }
-
   private async _handleGetStatus(
     requestId: string,
   ): Promise<LocalRestApiResponsePayload> {
@@ -131,7 +436,28 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
       currentTask,
       currentTaskId: currentTask?.id ?? null,
       taskCount: allTasks.length,
+      trackingOnOtherDevice: this._getTrackingOnOtherDevice(),
     });
+  }
+
+  /**
+   * The session another device is live-tracking (SuperSync presence), so
+   * clients that start tracking on their own (e.g. Parallel Code) can leave
+   * it alone instead of taking it over. Null while this device tracks, when
+   * the other device stopped or paused, or once its session went stale — a
+   * stale session must not block tracking here forever.
+   */
+  private _getTrackingOnOtherDevice(): {
+    taskId: string | null;
+    deviceLabel: string;
+    sinceTs: number;
+  } | null {
+    const view = this._trackingPresence.remoteSessionView();
+    const p = view?.session.payload;
+    if (!view || view.isStale || p?.state !== 'tracking') {
+      return null;
+    }
+    return { taskId: p.taskId, deviceLabel: p.deviceLabel, sinceTs: p.sinceTs };
   }
 
   private async _handleGetCurrentTask(
@@ -285,9 +611,9 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
     const isIgnoreShortSyntax = shortSyntaxFlag.value;
 
     const title = body.title.trim();
-    const additionalFields = pickAllowedFields(body);
+    const writableFields = pickAllowedFields(body);
 
-    const validation = validateWritableFields(additionalFields);
+    const validation = validateWritableFields(writableFields);
     if (!validation.ok) {
       return createErrorResponse(
         requestId,
@@ -298,7 +624,7 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
       );
     }
 
-    const deadlineValidationError = validateDeadlineFields(additionalFields);
+    const deadlineValidationError = validateDeadlineFields(writableFields);
     if (deadlineValidationError) {
       return createErrorResponse(
         requestId,
@@ -309,9 +635,9 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
     }
 
     const deadlineFields = Object.fromEntries(
-      DEADLINE_FIELDS.filter((field) => hasOwn(additionalFields, field)).map((field) => [
+      DEADLINE_FIELDS.filter((field) => hasOwn(writableFields, field)).map((field) => [
         field,
-        additionalFields[field],
+        writableFields[field],
       ]),
     ) as Partial<WritableTaskFields>;
     const deadlineResolution = resolveDeadlineChange(deadlineFields);
@@ -324,8 +650,9 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
       );
     }
     for (const field of DEADLINE_FIELDS) {
-      delete additionalFields[field];
+      delete writableFields[field];
     }
+    const additionalFields = mapLegacyPlannedAt(writableFields);
 
     if ('parentId' in body) {
       if (typeof body.parentId !== 'string' || !body.parentId) {
@@ -457,8 +784,8 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
           );
         }
 
-        const changes = pickAllowedFields(body);
-        const validation = validateWritableFields(changes);
+        const writableFields = pickAllowedFields(body);
+        const validation = validateWritableFields(writableFields);
         if (!validation.ok) {
           return createErrorResponse(
             requestId,
@@ -469,7 +796,7 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
           );
         }
 
-        const deadlineValidationError = validateDeadlineFields(changes);
+        const deadlineValidationError = validateDeadlineFields(writableFields);
         if (deadlineValidationError) {
           return createErrorResponse(
             requestId,
@@ -486,15 +813,14 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
         // An echoed `isDone: true` (GET→PATCH round trip) would only stamp a
         // new `doneOn`: it moves the completion date and turns a won't-do task
         // into a completed one.
-        if (changes.isDone === true && task.isDone) {
-          delete (changes as Record<string, unknown>).isDone;
+        if (writableFields.isDone === true && task.isDone) {
+          delete writableFields.isDone;
         }
 
         const deadlineFields = Object.fromEntries(
-          DEADLINE_FIELDS.filter((field) => hasOwn(changes, field)).map((field) => [
-            field,
-            changes[field],
-          ]),
+          DEADLINE_FIELDS.filter((field) => hasOwn(writableFields, field)).map(
+            (field) => [field, writableFields[field]],
+          ),
         ) as Partial<WritableTaskFields>;
         const deadlineResolution = resolveDeadlineChange(deadlineFields, task);
         if (!deadlineResolution.ok) {
@@ -506,8 +832,9 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
           );
         }
         for (const field of DEADLINE_FIELDS) {
-          delete changes[field];
+          delete writableFields[field];
         }
+        const changes = mapLegacyPlannedAt(writableFields);
 
         let isMoveOnly = false;
         if (hasOwn(changes, 'projectId')) {
@@ -568,6 +895,8 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
                 isIgnoreShortSyntax: true,
               }),
             );
+          } else if (hasOwn(changes, 'dueWithTime')) {
+            this._featureBridge.updateTaskWithDueTime(task, changes);
           } else {
             this._taskService.update(taskId, changes);
           }
@@ -660,6 +989,15 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
     const task = await this._getTaskWithSubTasksById(taskId);
     if (!task) {
       return createErrorResponse(requestId, 404, 'TASK_NOT_FOUND', 'Task not found');
+    }
+    // moveToArchive only archives top-level tasks: a subtask on its own stays where it is.
+    if (task.parentId) {
+      return createErrorResponse(
+        requestId,
+        400,
+        'INVALID_INPUT',
+        'Cannot archive a subtask on its own; archive its parent task, which takes its subtasks with it',
+      );
     }
 
     await this._taskService.moveToArchive(task);

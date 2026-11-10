@@ -4,26 +4,18 @@ import {
   LocalRestApiRequestPayload,
   LocalRestApiResponsePayload,
 } from '../../../../electron/shared-with-frontend/local-rest-api.model';
-import { isRecord } from '../../core/electron/local-rest-api-body';
 import { LocalRestApiFeatureRoutes } from '../../core/electron/local-rest-api-feature-routes';
 import {
   createErrorResponse,
   createSuccessResponse,
 } from '../../core/electron/local-rest-api-response';
 import {
+  getQueryParam,
+  isRecord,
   pickAllowedTaskRepeatCfgFields,
   validateWritableTaskRepeatCfgFields,
-} from './local-rest-api-task-repeat-config-fields';
+} from '../../core/electron/local-rest-api-handler.utils';
 import { TaskRepeatCfgService } from './task-repeat-cfg.service';
-
-const getQueryParam = (
-  query: Record<string, string | string[]>,
-  key: string,
-): string | undefined => {
-  const value = query[key];
-  if (value === undefined) return undefined;
-  return Array.isArray(value) ? value[0] : value;
-};
 
 /**
  * Local REST API routes under `/task-repeat-configs`: list, plus PATCH of

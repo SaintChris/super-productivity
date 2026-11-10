@@ -21,10 +21,10 @@ export const getLogicalTodayStartMs = (
  * Overdue comparison against a *precomputed* logical start-of-today threshold.
  * This is the single source of truth for "what counts as overdue"; both
  * `isTaskOverdue` and `selectOverdueTaskIds` route through it so the two overdue
- * definitions can never drift. `isTaskOverdue` is the entry point, and the
- * Local REST `?overdue=true` filter goes through it. Callers that iterate many
- * tasks (the selector) compute the threshold once and pass it in, instead of
- * per task.
+ * definitions can never drift. `isTaskOverdue` is the entry point callers
+ * should use; the local REST API's `?overdue=true` filter goes through it.
+ * Callers that iterate many tasks (the selector) compute
+ * the threshold once and pass it in, instead of per task.
  *
  * Priority follows the dueWithTime/dueDay mutual-exclusivity pattern.
  */
@@ -59,4 +59,22 @@ export const isTaskOverdue = (
     task,
     todayStr,
     getLogicalTodayStartMs(todayStr, startOfNextDayDiffMs),
+  );
+
+/**
+ * A task with no plan date whose deadline has passed (#9589). Kept separate from
+ * the plan-date overdue rule: only Today's overdue panel uses it, so the Planner
+ * (which lists missed deadlines on their own) does not show such tasks twice.
+ * A plan date always wins — the user already decided when to do the task.
+ */
+export const isTaskDeadlineMissedUnplanned = (
+  task: Pick<Task, 'dueDay' | 'dueWithTime' | 'deadlineDay' | 'deadlineWithTime'>,
+  todayStr: string,
+  todayStartMs: number,
+): boolean =>
+  !task.dueDay &&
+  !task.dueWithTime &&
+  !!(
+    (task.deadlineDay && isDBDateStr(task.deadlineDay) && task.deadlineDay < todayStr) ||
+    (task.deadlineWithTime && task.deadlineWithTime < todayStartMs)
   );
