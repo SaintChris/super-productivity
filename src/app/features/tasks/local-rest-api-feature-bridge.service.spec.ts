@@ -128,6 +128,15 @@ describe('LocalRestApiFeatureBridgeService', () => {
     expect(taskMoveToProjectServiceMock.moveToProject).not.toHaveBeenCalled();
   });
 
+  it('should report a task overdue when its due day is before logical today', () => {
+    expect(service.isTaskOverdue({ dueDay: '2026-05-11' } as Task, '2026-05-12', 0)).toBe(
+      true,
+    );
+    expect(service.isTaskOverdue({ dueDay: '2026-05-12' } as Task, '2026-05-12', 0)).toBe(
+      false,
+    );
+  });
+
   describe('updateTaskWithDueTime', () => {
     const dueWithTime = 1_778_590_800_000;
     const tenMinutes = 10 * 60 * 1000;

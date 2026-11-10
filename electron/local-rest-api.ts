@@ -3,6 +3,7 @@ import { log, warn } from 'electron-log/main';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
 import { once } from 'events';
 import { randomBytes, randomUUID } from 'crypto';
+import { unlinkSync } from 'fs';
 import { join } from 'path';
 import { readSecretFile, writeSecretFile } from './secure-file';
 import { timingSafeEqualLenient } from './crypto-utils';
@@ -34,6 +35,10 @@ let isInitialized = false;
 // token cannot be stored, and the saved setting stays `true` regardless. Kept
 // apart so a later recovery can tell "the user wants this on" from "it is on".
 let isEnabledDesired = false;
+// Set when a persisted token file auto-enabled the API at startup, so a saved
+// setting of `false` does not switch it off again on launch. Only an explicit
+// turn-off (the setting going from true to false) clears it.
+let isEnabledByTokenFile = false;
 let isListening = false;
 // Set once the user toggles the API in this session, so the startup read of the
 // persisted setting can never overwrite a newer choice.
@@ -103,6 +108,29 @@ const loadPersistedToken = (): string | undefined =>
 const persistToken = (token: string): void =>
   writeSecretFile(getTokenFilePath(), token, TOKEN_LABEL);
 
+/**
+ * Deletes the persisted token file. A present file auto-enables the API on the
+ * next launch, so an explicit turn-off has to remove it or the setting would
+ * not survive a restart. Never throws: turning the API off must not fail. A
+ * file that cannot be removed is logged, because the API will come back up on
+ * the next launch.
+ */
+const removePersistedToken = (): void => {
+  try {
+    unlinkSync(getTokenFilePath());
+    log('[local-rest-api] Removed the access token file — API stays off on next launch');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return;
+    }
+    warn(
+      '[local-rest-api] Could not remove the access token file — the API will ' +
+        'auto-enable again on next launch',
+      error,
+    );
+  }
+};
+
 /** Returns the active token, generating and persisting one if none exists yet. */
 const ensureToken = (): string => {
   if (!localRestApiToken) {
@@ -112,6 +140,16 @@ const ensureToken = (): string => {
     const token = generateToken();
     persistToken(token);
     localRestApiToken = token;
+  } else if (isEnabledDesired && !isForceEnabledForDev()) {
+    // An explicit turn-off deletes the file and leaves this token in memory,
+    // so an in-flight request is still told the API is off. Enabling again
+    // has to put that same token back on disk. This does not run while the
+    // API is off, or opening settings would recreate the file and the next
+    // launch would auto-enable.
+    const onDisk = loadPersistedToken();
+    if (onDisk !== localRestApiToken) {
+      persistToken(localRestApiToken);
+    }
   }
   return localRestApiToken;
 };
@@ -611,9 +649,29 @@ const restorePersistedEnabled = async (): Promise<void> => {
   await app.whenReady();
   const enabled = await readPersistedEnabled();
   // A toggle that landed while the file was being read is newer than it.
-  if (!hasExplicitEnabledChoice) {
-    applyEnabled(enabled);
+  if (hasExplicitEnabledChoice) {
+    return;
   }
+  // initLocalRestApi() runs before --user-data-dir is applied, so the token
+  // file is read here, once userData is final. A file starts the API even
+  // when the saved switch is off: agents enable a profile by writing the file.
+  if (!isForceEnabledForDev()) {
+    const persistedToken = loadPersistedToken();
+    if (persistedToken) {
+      log('[local-rest-api] Token file found on disk — auto-enabling API');
+      localRestApiToken = persistedToken;
+      isEnabledByTokenFile = true;
+      if (!enabled) {
+        log(
+          '[local-rest-api] Setting is off but a token file is present — keeping the API ' +
+            'on. Turn the setting on and off again to disable it.',
+        );
+      }
+      applyEnabled(true);
+      return;
+    }
+  }
+  applyEnabled(enabled);
 };
 
 const toListenError = (code: string | undefined): LocalRestApiListenError => {
@@ -649,7 +707,7 @@ const startServer = (): void => {
  * main process learns that storage works again — otherwise the setting reads
  * "enabled" while nothing listens, and stays that way until the next settings
  * change or restart. It cannot switch the API on by itself: `isEnabledDesired`
- * only ever comes from the saved setting.
+ * comes from the saved setting or from a token file found at startup.
  */
 const startServerIfDesired = (): void => {
   if (!isTokenStorageFailed) {
@@ -698,6 +756,15 @@ const stopServer = (): void => {
  */
 export const applyLocalRestApiEnabled = (enabled: boolean): void => {
   hasExplicitEnabledChoice = true;
+  // Only a real turn-off deletes the token file. A saved `false` at launch
+  // never reaches here while a token file is present: restorePersistedEnabled
+  // keeps the API on instead. Forced-dev mode does not use the file. The
+  // in-memory token stays so a request already being read still authenticates
+  // and is then refused as disabled; the file is what the next launch reads.
+  if ((isEnabledDesired || isEnabledByTokenFile) && !enabled && !isForceEnabledForDev()) {
+    isEnabledByTokenFile = false;
+    removePersistedToken();
+  }
   applyEnabled(enabled);
 };
 

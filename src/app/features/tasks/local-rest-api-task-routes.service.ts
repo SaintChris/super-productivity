@@ -296,17 +296,12 @@ const getQueryParam = (
   return Array.isArray(value) ? value[0] : value;
 };
 
-/**
- * `isIgnoreShortSyntax: true` in a POST/PATCH body stores the title literally:
- * `#tag`, `+project`, `30m`, `@date` and URLs are not parsed out of it. Opt-in
- * so scripts that rely on parsing keep working; returns an error message for a
- * non-boolean value.
- */
+/** Fork default stores titles literally. `false` opts into short-syntax parsing. */
 const readIsIgnoreShortSyntax = (
   body: Record<string, unknown>,
 ): { ok: true; value: boolean } | { ok: false; message: string } => {
   const value = body['isIgnoreShortSyntax'];
-  if (value === undefined) return { ok: true, value: false };
+  if (value === undefined) return { ok: true, value: true };
   return typeof value === 'boolean'
     ? { ok: true, value }
     : { ok: false, message: 'isIgnoreShortSyntax must be a boolean' };
@@ -522,6 +517,7 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
     const queryText = getQueryParam(query, 'query');
     const projectId = getQueryParam(query, 'projectId');
     const tagId = getQueryParam(query, 'tagId');
+    const overdue = getQueryParamAsBoolean(query, 'overdue', false);
     const includeDone = getQueryParamAsBoolean(query, 'includeDone', false);
     const VALID_SOURCES: TaskSource[] = ['active', 'archived', 'all'];
     const rawSource = getQueryParam(query, 'source') || 'active';
@@ -564,6 +560,14 @@ export class LocalRestApiTaskRoutesService implements LocalRestApiFeatureRoutes 
       filtered = filtered.filter((t) => isTaskInToday(t, todayStr, startOfNextDayDiffMs));
     } else if (tagId) {
       filtered = filtered.filter((t) => t.tagIds.includes(tagId));
+    }
+
+    if (overdue) {
+      const todayStr = this._dateService.todayStr();
+      const startOfNextDayDiffMs = this._dateService.getStartOfNextDayDiffMs();
+      filtered = filtered.filter((t) =>
+        this._featureBridge.isTaskOverdue(t, todayStr, startOfNextDayDiffMs),
+      );
     }
 
     if (!includeDone) {

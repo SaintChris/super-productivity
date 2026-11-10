@@ -1186,6 +1186,87 @@ test('switching the API off clears a token storage error', () => {
   }
 });
 
+// A token file on disk starts the API at launch even though the saved setting
+// is off. Agents enable a profile by writing the file. The saved `false` must
+// not undo that. Only an explicit turn-off deletes the file, so the next
+// launch stays off. The read waits until userData is final.
+test('a token file auto-enables at launch until the setting is switched off', async () => {
+  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sp-lra-tokenfile-'));
+  const tokenPath = path.join(profileDir, 'local-rest-api-token');
+  const existingToken = 'c'.repeat(32);
+  fs.writeFileSync(tokenPath, existingToken, { mode: 0o600 });
+  const port = takeIsolatedPort();
+  const ctx = createContext({ port, userDataDir: profileDir });
+  const isolated = loadModule(ctx);
+  const authedTasks = (token, onPort = port) =>
+    makeRequest(
+      { method: 'GET', path: '/tasks', headers: { Authorization: `Bearer ${token}` } },
+      undefined,
+      onPort,
+    );
+  let nextLaunch;
+
+  try {
+    isolated.initLocalRestApi();
+    await waitFor(
+      () => isolated.getLocalRestApiState().isListening,
+      'token-file listener',
+    );
+    assert.equal(isolated.getLocalRestApiState().isEnabled, true);
+    assert.equal((await authedTasks(existingToken)).status, 200);
+    assert.equal(fs.existsSync(path.join(profileDir, 'simpleSettings')), false);
+    assert.equal(fs.readFileSync(tokenPath, 'utf8').trim(), existingToken);
+
+    // The checkbox shows on, because that is what isEnabled reports. Turning
+    // it off is the true-to-false transition, and it deletes the file.
+    const setEnabled = ctx.handleHandlers.get('LOCAL_REST_API_SET_ENABLED');
+    assert.equal((await setEnabled({}, true)).isEnabled, true);
+    const off = await setEnabled({}, false);
+    assert.equal(off.isEnabled, false);
+    assert.equal(off.isListening, false);
+    await settleListen();
+    await assert.rejects(
+      () => makeRequest({ method: 'GET', path: '/health' }, undefined, port),
+      /ECONNREFUSED|ECONNRESET|socket hang up/,
+      'the API kept serving after the user switched it off',
+    );
+    assert.equal(
+      fs.existsSync(tokenPath),
+      false,
+      'the token file survived a turn-off, so the next launch would re-enable the API',
+    );
+
+    const nextPort = takeIsolatedPort();
+    nextLaunch = loadModule(createContext({ port: nextPort, userDataDir: profileDir }));
+    nextLaunch.initLocalRestApi();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(nextLaunch.getLocalRestApiState().isEnabled, false);
+    await assert.rejects(
+      () => makeRequest({ method: 'GET', path: '/health' }, undefined, nextPort),
+      /ECONNREFUSED/,
+      'the API came back on the launch after a turn-off',
+    );
+
+    const recreatedState = await setEnabled({}, true);
+    assert.equal(recreatedState.isEnabled, true);
+    await settleListen();
+    assert.ok(fs.existsSync(tokenPath), 'turning the API back on stored no token');
+    const recreated = fs.readFileSync(tokenPath, 'utf8').trim();
+    // Same token: turning off deletes the file, not the credential. Regeneration
+    // is what replaces it. The file has to come back or the next launch is off.
+    assert.equal(recreated, existingToken);
+    assert.equal(ctx.handleHandlers.get('LOCAL_REST_API_GET_TOKEN')(), recreated);
+    assert.equal((await authedTasks(recreated)).status, 200);
+  } finally {
+    await settleListen();
+    isolated.applyLocalRestApiEnabled(false);
+    if (nextLaunch) {
+      nextLaunch.applyLocalRestApiEnabled(false);
+    }
+    fs.rmSync(profileDir, { recursive: true, force: true });
+  }
+});
+
 test('SP_FORCE_LOCAL_REST_API can use an explicit dev token', async () => {
   const originalNodeEnv = process.env.NODE_ENV;
   const originalForce = process.env.SP_FORCE_LOCAL_REST_API;

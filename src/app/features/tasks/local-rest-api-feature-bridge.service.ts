@@ -11,13 +11,14 @@ import { addSubTask } from './store/task.actions';
 import { Task } from './task.model';
 import { TaskMoveToProjectService } from './task-move-to-project.service';
 import { TaskService } from './task.service';
+import { isTaskOverdue as isTaskOverdueUtil } from './util/is-task-overdue';
 import { withRemindAtForDueChange } from './util/with-remind-at-for-due-change';
 
 /**
  * Task operations the Local REST API task routes need that `TaskService`
  * doesn't offer as such: the issue link lookup, literal subtask titles,
  * back-filled time, project moves without the confirm dialog and due-time
- * changes that move the reminder.
+ * changes that move the reminder, plus the `?overdue=true` check.
  */
 @Injectable({ providedIn: 'root' })
 export class LocalRestApiFeatureBridgeService {
@@ -60,6 +61,10 @@ export class LocalRestApiFeatureBridgeService {
         isSkipConfirm: true,
       });
     }
+  }
+
+  isTaskOverdue(task: Task, todayStr: string, startOfNextDayDiffMs: number): boolean {
+    return isTaskOverdueUtil(task, todayStr, startOfNextDayDiffMs);
   }
 
   /**
