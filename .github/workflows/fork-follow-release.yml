@@ -148,7 +148,7 @@ jobs:
             echo "Branch order is \`.github/fork-follow-branches.txt\` on master."
             echo "The 11 PM build keeps the unchanged branch."
           } >"$RUNNER_TEMP/fork-follow-issue.md"
-          gh issue create --title "$title" --label waiting-for-alex --body-file "$RUNNER_TEMP/fork-follow-issue.md"
+          gh issue create --title "$title" --label waiting-for-alex --assignee SaintChris --body-file "$RUNNER_TEMP/fork-follow-issue.md"
           echo "created=true" >>"$GITHUB_OUTPUT"
 
       - name: Fail the run when a new issue was opened
